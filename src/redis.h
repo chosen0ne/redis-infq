@@ -62,6 +62,7 @@ typedef long long mstime_t; /* millisecond time type. */
 #include "util.h"    /* Misc functions useful in many places */
 #include "latency.h" /* Latency monitor API */
 #include "sparkline.h" /* ASII graphs API */
+#include "infq.h"
 
 /* Error codes */
 #define REDIS_OK                0
@@ -182,6 +183,7 @@ typedef long long mstime_t; /* millisecond time type. */
 #define REDIS_SET 2
 #define REDIS_ZSET 3
 #define REDIS_HASH 4
+#define REDIS_INFQ 5
 
 /* Objects encoding. Some kind of objects like Strings and Hashes can be
  * internally represented in multiple ways. The 'encoding' field of the object
@@ -195,6 +197,7 @@ typedef long long mstime_t; /* millisecond time type. */
 #define REDIS_ENCODING_INTSET 6  /* Encoded as intset */
 #define REDIS_ENCODING_SKIPLIST 7  /* Encoded as skiplist */
 #define REDIS_ENCODING_EMBSTR 8  /* Embedded sds string encoding */
+#define REDIS_ENCODING_INFQ 9
 
 /* Defines related to the dump file format. To store 32 bits lengths for short
  * keys requires a lot of space, so we check the most significant 2 bits of
@@ -274,6 +277,7 @@ typedef long long mstime_t; /* millisecond time type. */
 #define REDIS_REPL_RECEIVE_PONG 3 /* Wait for PING reply */
 #define REDIS_REPL_TRANSFER 4 /* Receiving .rdb from master */
 #define REDIS_REPL_CONNECTED 5 /* Connected to master */
+#define REDIS_REPL_RECV_INFQ 11 /* Receiving files of InfQ from master */
 
 /* Slave replication state - from the point of view of the master.
  * In SEND_BULK and ONLINE state the slave receives new updates
@@ -283,6 +287,7 @@ typedef long long mstime_t; /* millisecond time type. */
 #define REDIS_REPL_WAIT_BGSAVE_END 7 /* Waiting RDB file creation to finish. */
 #define REDIS_REPL_SEND_BULK 8 /* Sending RDB file to slave. */
 #define REDIS_REPL_ONLINE 9 /* RDB file transmitted, sending just updates. */
+#define REDIS_REPL_SEND_INFQ 10 /* Sending files of InfQ to slave */
 
 /* Synchronous read timeout - slave side */
 #define REDIS_REPL_SYNCIO_TIMEOUT 5
@@ -904,6 +909,15 @@ struct redisServer {
     int assert_line;
     int bug_report_start; /* True if bug report header was already logged. */
     int watchdog_period;  /* Software watchdog period in ms. 0 = off */
+
+    /* Configurations for InfQ */
+    int infq_logging_level;
+    char *infq_data_path;   /* Data path to store infQs, identified by keys */
+    int infq_mem_block_size;
+    int infq_pushq_blocks_num;
+    int infq_popq_blocks_num;
+    float infq_dump_blocks_usage; /* trigger dump job when blocks used exceed
+                                     'infq_dump_blocks_usage'*/
 };
 
 typedef struct pubsubPattern {
@@ -1532,6 +1546,18 @@ void pfcountCommand(redisClient *c);
 void pfmergeCommand(redisClient *c);
 void pfdebugCommand(redisClient *c);
 void latencyCommand(redisClient *c);
+
+/* Support for InfQ */
+robj *createInfqObject(robj *key);
+void qpushCommand(redisClient *c);
+void qpopCommand(redisClient *c);
+void qlenCommand(redisClient *c);
+void qtopCommand(redisClient *c);
+void qjpopCommand(redisClient *c);
+void qdelCommand(redisClient *c);
+void qatCommand(redisClient *c);
+void qrangeCommand(redisClient *c);
+/* Support for InfQ */
 
 #if defined(__GNUC__)
 void *calloc(size_t count, size_t size) __attribute__ ((deprecated));

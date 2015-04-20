@@ -29,12 +29,17 @@
  */
 
 #include "redis.h"
+#include "infq.h"
 #include <math.h>
 #include <ctype.h>
 
 #ifdef __CYGWIN__
 #define strtold(a,b) ((long double)strtod((a),(b)))
 #endif
+
+void infq_info_log(const char *msg);
+void infq_error_log(const char *smg);
+void infq_debug_log(const char *msg);
 
 robj *createObject(int type, void *ptr) {
     robj *o = zmalloc(sizeof(*o));
@@ -231,6 +236,51 @@ robj *createZsetZiplistObject(void) {
     unsigned char *zl = ziplistNew();
     robj *o = createObject(REDIS_ZSET,zl);
     o->encoding = REDIS_ENCODING_ZIPLIST;
+    return o;
+}
+
+robj *createInfqObject(robj *key) {
+    infq_config_t   conf;
+    char            buf[1024];
+    int             ret, len;
+    sds             s;
+
+    if (key != NULL) {
+        if (key->type != REDIS_STRING) {
+            redisLog(REDIS_WARNING, "key is not a string");
+            return NULL;
+        }
+
+        s = key->ptr;
+        len = strlen(server.infq_data_path);
+        if (len && server.infq_data_path[len - 1] != '/') {
+            ret = snprintf(buf, 1024, "%s/%s", server.infq_data_path, s);
+        } else {
+            ret = snprintf(buf, 1024, "%s%s", server.infq_data_path, s);
+        }
+    } else {
+        ret = snprintf(buf, 1024, "%s", server.infq_data_path);
+    }
+
+    if (ret < 0 || ret >= 1024) {
+        redisLog(REDIS_NOTICE, "failed to generate datapath for infq,"
+                "buf len: 104, expected: %d, err: %s", ret, strerror(errno));
+        return NULL;
+    }
+
+    infq_config_logging(server.infq_logging_level, infq_debug_log, infq_info_log, infq_error_log);
+    conf.mem_block_size = server.infq_mem_block_size;
+    conf.pushq_blocks_num = server.infq_pushq_blocks_num;
+    conf.popq_blocks_num = server.infq_popq_blocks_num;
+    conf.data_path = buf;
+    conf.block_usage_to_dump = server.infq_dump_blocks_usage;
+    infq_t* q = infq_init_by_conf(&conf);
+    if (q == NULL) {
+        redisLog(REDIS_NOTICE, "failed to init infQ, data_path: %s", buf);
+        return NULL;
+    }
+    robj *o = createObject(REDIS_INFQ, q);
+    o->encoding = REDIS_ENCODING_INFQ;
     return o;
 }
 
@@ -737,3 +787,17 @@ void objectCommand(redisClient *c) {
     }
 }
 
+void infq_debug_log(const char *msg)
+{
+    redisLog(REDIS_DEBUG, "[INFQ_DEBUG]: %s", msg);
+}
+
+void infq_info_log(const char *msg)
+{
+    redisLog(REDIS_NOTICE, "[INFQ_INFO]: %s", msg);
+}
+
+void infq_error_log(const char *msg)
+{
+    redisLog(REDIS_WARNING, "[INFQ_ERR]: %s", msg);
+}

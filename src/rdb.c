@@ -31,6 +31,7 @@
 #include "lzf.h"    /* LZF compression library */
 #include "zipmap.h"
 #include "endianconv.h"
+#include "infq.h"
 
 #include <math.h>
 #include <sys/types.h>
@@ -460,6 +461,8 @@ int rdbSaveObjectType(rio *rdb, robj *o) {
             return rdbSaveType(rdb,REDIS_RDB_TYPE_HASH);
         else
             redisPanic("Unknown hash encoding");
+    case REDIS_INFQ:
+        return rdbSaveType(rdb, REDIS_RDB_TYPE_INFQ);
     default:
         redisPanic("Unknown object type");
     }
@@ -588,7 +591,19 @@ int rdbSaveObject(rio *rdb, robj *o) {
         } else {
             redisPanic("Unknown hash encoding");
         }
+    } else if (o->type == REDIS_INFQ) {
+        infq_t  *q = o->ptr;
+        char    buf[1024];
+        int     size;
 
+        if (infq_dump(q, buf, 1024, &size) == INFQ_ERR) {
+            redisLog(REDIS_WARNING, "failed to dump infq");
+            return -1;
+        }
+
+        // Len + Data
+        nwritten += rdbSaveLen(rdb, size);
+        nwritten += rdbSaveRawString(rdb, (unsigned char *)buf, size);
     } else {
         redisPanic("Unknown object type");
     }
@@ -1072,6 +1087,29 @@ robj *rdbLoadObject(int rdbtype, rio *rdb) {
             default:
                 redisPanic("Unknown encoding");
                 break;
+        }
+    } else if (rdbtype == REDIS_RDB_TYPE_INFQ) {
+        o = createInfqObject(NULL);
+        if (o == NULL) {
+            redisLog(REDIS_WARNING, "failed to create robj of infQ");
+            return NULL;
+        }
+
+        unsigned int    buf_len = rdbLoadLen(rdb, NULL);
+        if (buf_len == REDIS_RDB_LENERR) {
+            redisLog(REDIS_WARNING, "failed to read buf length");
+            return NULL;
+        }
+
+        robj *buf = rdbLoadStringObject(rdb);
+        if (buf == NULL) {
+            redisLog(REDIS_WARNING, "failed to read dump buf of infq");
+            return NULL;
+        }
+
+        if (infq_load(o->ptr, buf->ptr, buf_len) == INFQ_ERR) {
+            redisLog(REDIS_WARNING, "failed to load infq");
+            return NULL;
         }
     } else {
         redisPanic("Unknown object type");

@@ -77,6 +77,35 @@ sds sdsnew(const char *init) {
     return sdsnewlen(init, initlen);
 }
 
+sds sdsinit(const void *buf, size_t buflen) {
+    struct sdshdr *sh;
+
+    if (buflen < sizeof(struct sdshdr)) {
+        return NULL;
+    }
+
+    sh = (struct sdshdr *)buf;
+    if (sh->len > buflen - sizeof(struct sdshdr) - 1) {
+        return NULL;
+    }
+
+    return sh->buf;
+}
+
+void sdsraw(const sds s, void **ptr, size_t *size) {
+    if (ptr == NULL || size == NULL) {
+        ptr = NULL;
+        size = NULL;
+        return;
+    }
+
+    struct sdshdr *sh;
+
+    sh = (void *)(s - sizeof(struct sdshdr));
+    *size = sizeof(struct sdshdr) + sh->len + 1;
+    *ptr = sh;
+}
+
 /* Duplicate an sds string. */
 sds sdsdup(const sds s) {
     return sdsnewlen(s, sdslen(s));

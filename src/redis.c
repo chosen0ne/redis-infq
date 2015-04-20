@@ -283,7 +283,15 @@ struct redisCommand redisCommandTable[] = {
     {"pfcount",pfcountCommand,-2,"r",0,NULL,1,1,1,0,0},
     {"pfmerge",pfmergeCommand,-2,"wm",0,NULL,1,-1,1,0,0},
     {"pfdebug",pfdebugCommand,-3,"w",0,NULL,0,0,0,0,0},
-    {"latency",latencyCommand,-2,"arslt",0,NULL,0,0,0,0,0}
+    {"latency",latencyCommand,-2,"arslt",0,NULL,0,0,0,0,0},
+    {"qpush",qpushCommand,-3,"wmF",0,NULL,1,1,1,0,0},
+    {"qpop",qpopCommand,2,"wmF",0,NULL,1,1,1,0,0},
+    {"qjpop",qjpopCommand,2,"wmF",0,NULL,1,1,1,0,0},
+    {"qlen",qlenCommand,2,"rF",0,NULL,1,1,1,0,0},
+    {"qtop",qtopCommand,2,"rF",0,NULL,1,1,1,0,0},
+    {"qdel",qdelCommand,2,"wF",0,NULL,1,1,1,0,0},
+    {"qat",qatCommand,3,"r",0,NULL,1,1,1,0,0},
+    {"qrange",qrangeCommand,4,"r",0,NULL,1,1,1,0,0}
 };
 
 struct evictionPoolEntry *evictionPoolAlloc(void);
@@ -1548,6 +1556,13 @@ void initServerConfig(void) {
     server.assert_line = 0;
     server.bug_report_start = 0;
     server.watchdog_period = 0;
+
+    /* InfQ */
+    server.infq_data_path = "./infq_data/";
+    server.infq_popq_blocks_num = 20;
+    server.infq_pushq_blocks_num = 20;
+    server.infq_mem_block_size = 32 * 1024 * 1024;
+    server.infq_dump_blocks_usage = 0.5;
 }
 
 /* This function will try to raise the max number of open files accordingly to

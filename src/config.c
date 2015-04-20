@@ -30,6 +30,7 @@
 
 #include "redis.h"
 #include "cluster.h"
+#include "infq.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -540,6 +541,36 @@ void loadServerConfigFromString(char *config) {
                 err = sentinelHandleConfiguration(argv+1,argc-1);
                 if (err) goto loaderr;
             }
+        } else if (!strcasecmp(argv[0], "infq-logging-level")) {
+            if (!strcasecmp(argv[1], "DEBUG")) {
+                server.infq_logging_level = INFQ_DEBUG_LEVEL;
+            } else if (!strcasecmp(argv[1], "INFO")) {
+                server.infq_logging_level = INFQ_INFO_LEVEL;
+            } else if (!strcasecmp(argv[1], "ERROR")) {
+                server.infq_logging_level = INFQ_ERROR_LEVEL;
+            } else {
+                err = "unsupported logging level for InfQ";
+                goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0], "infq-data-path")) {
+            if (argv[1][strlen(argv[1]) - 1] != '/') {
+                err = "data path for InfQ must be a dir and the last"
+                    "character must be /";
+                goto loaderr;
+            }
+            server.infq_data_path = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0], "infq-mem-block-size")) {
+            server.infq_mem_block_size = atoi(argv[1]);
+            if (server.infq_mem_block_size < 1024) {
+                err = "memory block size is too small for InfQ";
+                goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0], "infq-pushq-blocks-num")) {
+            server.infq_pushq_blocks_num = atoi(argv[1]);
+        } else if (!strcasecmp(argv[0], "infq-popq-blocks-num")) {
+            server.infq_popq_blocks_num = atoi(argv[1]);
+        } else if (!strcasecmp(argv[0], "infq-dump-blocks-usage")) {
+            server.infq_dump_blocks_usage = atof(argv[1]);
         } else {
             err = "Bad directive or wrong number of arguments"; goto loaderr;
         }
