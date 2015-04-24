@@ -574,27 +574,6 @@ int pathIsBaseName(char *path) {
     return strchr(path,'/') == NULL && strchr(path,'\\') == NULL;
 }
 
-void fetchAbsPath(sds out, sds dir, int isDir, ...) {
-    va_list     ap;
-    sds         seg;
-
-    out = sdsdup(dir);
-    va_start(ap, isDir);
-    while ((seg = va_arg(ap, sds)) != NULL) {
-        if (out[strlen(out) - 1] != '/') {
-            out = sdscat(out, "/");
-        }
-        out = sdscatsds(out, seg);
-    }
-    va_end(ap);
-
-    if (isDir) {
-        if (out[strlen(out) - 1] != '/') {
-            out = sdscat(out, "/");
-        }
-    }
-}
-
 #ifdef UTIL_TEST_MAIN
 #include <assert.h>
 

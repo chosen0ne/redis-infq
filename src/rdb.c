@@ -815,14 +815,6 @@ int rdbSaveBackground(char *filename) {
                 redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
                 retval = REDIS_ERR;
             } else {
-                redisLog(REDIS_DEBUG, "[INFQ] dp: %s, f: {s: %d, e: %d, p: %s}, p: {s: %d, e: %d, p: %s}",
-                        server.infq_file_meta->data_path,
-                        server.infq_file_meta->file_blk_start,
-                        server.infq_file_meta->file_blk_end,
-                        server.infq_file_meta->file_blk_prefix,
-                        server.infq_file_meta->pop_blk_start,
-                        server.infq_file_meta->pop_blk_end,
-                        server.infq_file_meta->pop_blk_prefix);
                 infq_fetch_file_meta(q->ptr, server.infq_file_meta);
                 redisLog(REDIS_DEBUG, "[INFQ] dp: %s, f: {s: %d, e: %d, p: %s}, p: {s: %d, e: %d, p: %s}",
                         server.infq_file_meta->data_path,
