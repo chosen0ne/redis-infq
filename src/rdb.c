@@ -802,6 +802,38 @@ int rdbSaveBackground(char *filename) {
                     private_dirty/(1024*1024));
             }
         }
+
+        // pass file meta info of InfQ to parent
+        if (server.infq_file_meta != NULL) {
+            robj key;
+            initStaticStringObject(key, server.infq_key);
+            robj *q = lookupKeyRead(server.infq_db, &key);
+            if (q == NULL) {
+                redisLog(REDIS_WARNING, "[FATAL]failed to fetch info by dict of key => db");
+                retval = REDIS_ERR;
+            } else if (q->type != REDIS_INFQ) {
+                redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
+                retval = REDIS_ERR;
+            } else {
+                redisLog(REDIS_DEBUG, "[INFQ] dp: %s, f: {s: %d, e: %d, p: %s}, p: {s: %d, e: %d, p: %s}",
+                        server.infq_file_meta->data_path,
+                        server.infq_file_meta->file_blk_start,
+                        server.infq_file_meta->file_blk_end,
+                        server.infq_file_meta->file_blk_prefix,
+                        server.infq_file_meta->pop_blk_start,
+                        server.infq_file_meta->pop_blk_end,
+                        server.infq_file_meta->pop_blk_prefix);
+                infq_fetch_file_meta(q->ptr, server.infq_file_meta);
+                redisLog(REDIS_DEBUG, "[INFQ] dp: %s, f: {s: %d, e: %d, p: %s}, p: {s: %d, e: %d, p: %s}",
+                        server.infq_file_meta->data_path,
+                        server.infq_file_meta->file_blk_start,
+                        server.infq_file_meta->file_blk_end,
+                        server.infq_file_meta->file_blk_prefix,
+                        server.infq_file_meta->pop_blk_start,
+                        server.infq_file_meta->pop_blk_end,
+                        server.infq_file_meta->pop_blk_prefix);
+            }
+        }
         exitFromChild((retval == REDIS_OK) ? 0 : 1);
     } else {
         /* Parent */
@@ -1246,6 +1278,12 @@ int rdbLoad(char *filename) {
         }
         /* Add the new object in the hash table */
         dbAdd(db,key,val);
+
+        if (type == REDIS_RDB_TYPE_INFQ) {
+            server.infq_key = sdsdup(key->ptr);
+            server.infq_db = db;
+            redisLog(REDIS_DEBUG, "infq key: %s", server.infq_key);
+        }
 
         /* Set the expire time if needed */
         if (expiretime != -1) setExpire(db,key,expiretime);

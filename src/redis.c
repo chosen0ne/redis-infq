@@ -52,6 +52,7 @@
 #include <sys/resource.h>
 #include <sys/utsname.h>
 #include <locale.h>
+#include <sys/mman.h>
 
 /* Our shared "common" objects */
 
@@ -1563,6 +1564,7 @@ void initServerConfig(void) {
     server.infq_pushq_blocks_num = 20;
     server.infq_mem_block_size = 32 * 1024 * 1024;
     server.infq_dump_blocks_usage = 0.5;
+    server.infq_file_meta = NULL;
 }
 
 /* This function will try to raise the max number of open files accordingly to
@@ -1846,6 +1848,20 @@ void initServer(void) {
     server.aof_last_write_errno = 0;
     server.repl_good_slaves_count = 0;
     updateCachedTime();
+
+    server.infq_key = NULL;
+    server.infq_file_meta = (infq_file_meta_t *)mmap(
+            NULL,
+            sizeof(infq_file_meta_t),
+            PROT_READ | PROT_WRITE,
+            MAP_ANON | MAP_SHARED,
+            -1,
+            0);
+    if (server.infq_file_meta == MAP_FAILED) {
+        redisLog(REDIS_WARNING, "failed to create shared memory, err: %s", strerror(errno));
+        exit(1);
+    }
+    server.repl_infq_files = NULL;
 
     /* Create the serverCron() time event, that's our main way to process
      * background operations. */

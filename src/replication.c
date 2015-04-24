@@ -37,6 +37,11 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 
+struct infqFileInfo {
+    const char *prefix;
+    int suffix;
+};
+
 void replicationDiscardCachedMaster(void);
 void replicationResurrectCachedMaster(int newfd);
 void replicationSendAck(void);
@@ -673,6 +678,152 @@ void putSlaveOnline(redisClient *slave) {
         replicationGetSlaveName(slave));
 }
 
+int openAndFillState(redisClient *slave) {
+    struct redis_stat buf;
+    sds path = sdsempty();
+
+    // TODO: support relative path
+    path = sdscatprintf(path, "%s/%s_%d",
+            server.infq_file_meta->data_path,
+            slave->repl_infq_file_prefix,
+            slave->repl_infq_file_suffix);
+    // NOTICE: each slave may open the file.
+    if ((slave->repldbfd = open(path, O_RDONLY)) == -1 ||
+            redis_fstat(slave->repldbfd, &buf) == -1) {
+        redisLog(REDIS_WARNING, "SYNC failed. Can't open/stat InfQ Files, path: %s, prefix: %s, suffix: %d, err: %s",
+                path,
+                slave->repl_infq_file_prefix,
+                slave->repl_infq_file_suffix,
+                strerror(errno));
+        return REDIS_ERR;
+    }
+    slave->repldboff = 0;
+    slave->repldbsize = buf.st_size;
+    slave->replstate = REDIS_REPL_SEND_INFQ;
+
+    sdsfree(path);
+
+    return REDIS_OK;
+}
+
+void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
+    redisClient *slave = privdata;
+    REDIS_NOTUSED(el);
+    REDIS_NOTUSED(mask);
+    char buf[REDIS_IOBUF_LEN];
+    ssize_t nwritten, buflen;
+
+    // InfQ Header: Key + Data Path + File Number
+    if (slave->replpreamble) {
+        nwritten = write(fd,slave->replpreamble,sdslen(slave->replpreamble));
+        if (nwritten == -1) {
+            redisLog(REDIS_VERBOSE,"Write error sending InfQ files preamble to slave: %s",
+                strerror(errno));
+            freeClient(slave);
+            return;
+        }
+        server.stat_net_output_bytes += nwritten;
+        sdsrange(slave->replpreamble,nwritten,-1);
+        if (sdslen(slave->replpreamble) == 0) {
+            sdsfree(slave->replpreamble);
+            slave->replpreamble = NULL;
+
+            int file_num = server.infq_file_meta->file_blk_end -
+                    server.infq_file_meta->file_blk_start +
+                    server.infq_file_meta->pop_blk_end - server.infq_file_meta->pop_blk_start;
+            /**
+             * NOTICE: 当redis中没有InfQ对象，或者存在InfQ对象但是不需传输文件，
+             *      那么值传输一个header，表明“不需要传输文件”，slave接收到这个Header后，
+             *      会跳过接收文件的过程。
+             */
+            if (server.infq_key == NULL || file_num == 0) {
+                // no need to transfer files
+                aeDeleteFileEvent(server.el, slave->fd, AE_WRITABLE);
+                putSlaveOnline(slave);
+            }
+            /* fall through sending data. */
+        } else {
+            return;
+        }
+    }
+
+    // File Header: File Prefix + File Suffix + File Size
+    if (slave->reploff == -1) {
+        sds file_header;
+        listNode *node;
+        struct infqFileInfo *finfo;
+
+        node = listNext(slave->repl_infq_file_iter);
+        // all files are transfered to Slave
+        if (node == NULL) {
+            if (slave->repl_infq_file_iter != NULL) {
+                listReleaseIterator(slave->repl_infq_file_iter);
+                slave->repl_infq_file_iter = NULL;
+            }
+            aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
+            putSlaveOnline(slave);
+            return;
+        }
+
+        finfo = node->value;
+        slave->repl_infq_file_prefix = finfo->prefix;
+        slave->repl_infq_file_suffix = finfo->suffix;
+
+        if (openAndFillState(slave) == REDIS_ERR) {
+            freeClient(slave);
+            return;
+        }
+        file_header = sdscatprintf(sdsempty(), "$%s %d %lld\r\n",
+                slave->repl_infq_file_prefix,
+                slave->repl_infq_file_suffix,
+                slave->repldbsize);
+        nwritten = write(fd, file_header, sdslen(file_header));
+        if (nwritten == -1) {
+            redisLog(REDIS_VERBOSE,"Write error sending InfQ files header to slave, "
+                    "prefix: %s, suffix: %d, err: %s",
+                    slave->repl_infq_file_prefix, slave->repl_infq_file_suffix, strerror(errno));
+            freeClient(slave);
+            return;
+        }
+        server.stat_net_output_bytes += nwritten;
+        sdsfree(file_header);
+        /* fall through to send file block */
+    }
+
+    lseek(slave->repldbfd, slave->reploff, SEEK_SET);
+    buflen = read(slave->repldbfd, buf, REDIS_IOBUF_LEN);
+    if (buflen <= 0) {
+        redisLog(REDIS_VERBOSE,"Read file error sending InfQ files to slave, "
+                "prefix: %s, suffix: %d, err: %s",
+                slave->repl_infq_file_prefix, slave->repl_infq_file_suffix, strerror(errno));
+        freeClient(slave);
+        return;
+    }
+    if ((nwritten = write(fd, buf, buflen)) == -1) {
+        if (errno != EAGAIN) {
+            redisLog(REDIS_VERBOSE,"Write error sending InfQ file block to slave, "
+                    "prefix: %s, suffix: %d, err: %s",
+                    slave->repl_infq_file_prefix, slave->repl_infq_file_suffix, strerror(errno));
+            freeClient(slave);
+            return;
+        }
+    }
+
+    slave->repldboff += nwritten;
+    server.stat_net_output_bytes += nwritten;
+    // finish one file transfer
+    if (slave->repldboff == slave->repldbsize) {
+        close(slave->repldbfd);
+        slave->reploff = -1;
+        slave->repldbfd = -1;
+    }
+}
+
+void infq_files_free(void *val) {
+    if (val != NULL)
+        zfree(val);
+}
+
 void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
     redisClient *slave = privdata;
     REDIS_NOTUSED(el);
@@ -721,11 +872,59 @@ void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
     }
     slave->repldboff += nwritten;
     server.stat_net_output_bytes += nwritten;
+    // finish rdb file transferring
     if (slave->repldboff == slave->repldbsize) {
         close(slave->repldbfd);
         slave->repldbfd = -1;
         aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
-        putSlaveOnline(slave);
+
+        // start to transfer InfQ's files if the instance holds InfQ
+        // file meta info of InfQ has loaded by rdb process
+        // initial state of the slave client
+        slave->reploff = -1;
+        int file_num = server.infq_file_meta->file_blk_end -
+                server.infq_file_meta->file_blk_start +
+                server.infq_file_meta->pop_blk_end - server.infq_file_meta->pop_blk_start;
+        // InfQ Header
+        if (server.infq_key == NULL || file_num == 0) {
+            slave->replpreamble = sdsnewlen("$# # 0\r\n", 8);
+        } else {
+            slave->replpreamble = sdscatprintf(sdsempty(),"$%s %s %d\r\n",
+                    server.infq_key,
+                    server.infq_file_meta->data_path,
+                    file_num);
+        }
+
+        // fetch all files need to transfer to Slave
+        if (server.repl_infq_files != NULL) {
+            listRelease(server.repl_infq_files);
+        }
+        if (file_num > 0) {
+            server.repl_infq_files = listCreate();
+            listSetFreeMethod(server.repl_infq_files, infq_files_free);
+
+            // file blocks
+            for (int i = server.infq_file_meta->file_blk_start; i < server.infq_file_meta->file_blk_end; i++) {
+                struct infqFileInfo *f = zmalloc(sizeof(struct infqFileInfo));
+                f->prefix = server.infq_file_meta->file_blk_prefix;
+                f->suffix = i;
+                listAddNodeTail(server.repl_infq_files, f);
+            }
+            // pop blocks
+            for (int i = server.infq_file_meta->pop_blk_start; i < server.infq_file_meta->pop_blk_end; i++) {
+                struct infqFileInfo *f = zmalloc(sizeof(struct infqFileInfo));
+                f->prefix = server.infq_file_meta->pop_blk_prefix;
+                f->suffix = i;
+                listAddNodeTail(server.repl_infq_files, f);
+            }
+
+            slave->repl_infq_file_iter = listGetIterator(server.repl_infq_files, AL_START_HEAD);
+        }
+
+        if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE, sendInfQFilesToSlave, slave) == AE_ERR) {
+            freeClient(slave);
+            return;
+        }
     }
 }
 
@@ -858,6 +1057,366 @@ void replicationEmptyDbCallback(void *privdata) {
 
 /* Asynchronously read the SYNC payload we receive from a master */
 #define REPL_MAX_WRITTEN_BEFORE_FSYNC (1024*1024*8) /* 8 MB */
+
+int checkReadBuf(const char *buf) {
+    if (buf[0] == '-') {
+        redisLog(REDIS_WARNING,
+            "MASTER aborted replication with an error: %s",
+            buf+1);
+        return REDIS_ERR;
+    } else if (buf[0] == '\0') {
+        server.repl_transfer_lastio = server.unixtime;
+        return REDIS_ERR;
+    } else if (buf[0] != '$') {
+        redisLog(REDIS_WARNING,"Bad protocol from MASTER, the first byte is not '$' (we received '%s'), are you sure the host and port are right?", buf);
+        return REDIS_ERR;
+    }
+
+    return REDIS_OK;
+}
+
+int make_sure_single_dir(sds abs_dir) {
+    struct redis_stat buf;
+
+    if (access(abs_dir, F_OK) == -1) {
+        if (mkdir(abs_dir, 0755) == -1) {
+            redisLog(REDIS_WARNING, "failed to mkdir, dir: %s", abs_dir);
+            return REDIS_ERR;
+        }
+        redisLog(REDIS_NOTICE, "dir doesn't exist, create it, dir: %s", abs_dir);
+        return REDIS_OK;
+    }
+
+    if (redis_stat(abs_dir, &buf) == -1) {
+        redisLog(REDIS_WARNING, "failed to fstat, path: %s", abs_dir);
+        return REDIS_ERR;
+    }
+
+    if (S_ISDIR(buf.st_mode)) {
+        return REDIS_OK;
+    }
+    redisLog(REDIS_WARNING, "path exists, but not a dir, path: %s", abs_dir);
+
+    return REDIS_ERR;
+}
+
+int make_sure_dirs(sds dir, sds sub_dir) {
+    sds abs_dir = getAbsolutePath(dir);
+    sds abs_sub_dir;
+    int ret = REDIS_ERR;
+
+    if (abs_dir[strlen(abs_dir) - 1] == '/') {
+        abs_sub_dir = sdscatprintf(sdsempty(), "%s%s", abs_dir, sub_dir);
+    } else {
+        abs_sub_dir = sdscatprintf(sdsempty(), "%s/%s", abs_dir, sub_dir);
+    }
+
+    if (make_sure_single_dir(abs_dir) == REDIS_OK &&
+            make_sure_single_dir(abs_sub_dir) == REDIS_OK ) {
+        ret = REDIS_OK;
+    }
+
+    sdsfree(abs_dir);
+    sdsfree(abs_sub_dir);
+
+    return ret;
+}
+
+void resetSds(sds *s) {
+    if (*s != NULL) {
+        sdsfree(*s);
+        *s = NULL;
+    }
+}
+
+void replicationAbortRecvInfQ() {
+    redisAssert(server.repl_state == REDIS_REPL_RECV_INFQ);
+
+    aeDeleteFileEvent(server.el, server.repl_transfer_s, AE_READABLE);
+    close(server.repl_transfer_s);
+    close(server.repl_transfer_fd);
+    unlink(server.repl_transfer_tmpfile);
+    zfree(server.repl_transfer_tmpfile);
+
+    // TODO: remove all temp files and dir
+    resetSds(&server.repl_infq_temp_dir);
+    resetSds(&server.repl_infq_key);
+    resetSds(&server.repl_infq_dir);
+    resetSds(&server.repl_infq_data_path);
+    resetSds(&server.repl_infq_file_prefix);
+
+    server.repl_state = REDIS_REPL_CONNECT;
+}
+
+int readInfQHeader(int fd) {
+    char buf[4096], *cp;
+    sds line, *argv, tmp_dir;
+    int argc;
+
+    if (syncReadLine(fd, buf, 4096, server.repl_syncio_timeout * 1000) == -1) {
+        redisLog(REDIS_WARNING,
+            "I/O error reading bulk count from MASTER: %s",
+            strerror(errno));
+        return REDIS_ERR;
+    }
+
+    if (checkReadBuf(buf) == REDIS_ERR) {
+        return REDIS_ERR;
+    }
+
+    line = sdsnewlen(buf + 1, strlen(buf + 1));
+    argv = sdssplitargs(line, &argc);
+    if (argv == NULL) {
+        redisLog(REDIS_WARNING, "failed to load InfQ Header");
+        return REDIS_ERR;
+    }
+    if (argc != 3) {
+        redisLog(REDIS_WARNING, "arg count error, expect 3 args, actual: %d", argc);
+        return REDIS_ERR;
+    }
+
+    server.repl_infq_file_num = strtol(argv[2], NULL, 10);
+    if (server.repl_infq_file_num == 0) {
+        return REDIS_OK;
+    }
+
+    server.repl_infq_key = sdsdup(argv[0]);
+
+    // Data path that master transfered consists of Data Path + Key, here remove the key.
+    server.repl_infq_data_path = sdsdup(argv[1]);
+    cp = server.repl_infq_data_path + (strlen(server.repl_infq_data_path) - 1);
+    while (cp >= server.repl_infq_data_path && *cp != '/') {
+        cp--;
+    }
+    if (*cp == '/') {
+        *cp = '\0';
+        sdsupdatelen(server.repl_infq_data_path);
+    } else {
+        redisLog(REDIS_WARNING, "format of data path is unexpected, expect: Data Path + Key, actual: %s",
+                server.repl_infq_data_path);
+        return REDIS_ERR;
+    }
+
+    redisLog(REDIS_NOTICE,
+            "MASTER <-> SLAVE sync: receiving %d InfQ files from master, data path: %s, key: %s",
+            server.repl_infq_file_num,
+            server.repl_infq_data_path,
+            server.repl_infq_key);
+    sdsfreesplitres(argv,argc);
+
+    // make sure of Data_Path/Key dirs' existence
+    tmp_dir = sdscatprintf(sdsempty(), "temp-%s-%d.%ld",
+            server.repl_infq_key, (int)server.unixtime, (long int)getpid());
+    if (make_sure_dirs(
+                server.repl_infq_data_path,
+                tmp_dir) == REDIS_ERR) {
+        redisLog(REDIS_WARNING, "failed to make sure dir, data path: %s, sud dir: %s",
+                server.repl_infq_data_path, server.repl_infq_key);
+        return REDIS_ERR;
+    }
+
+    if (server.repl_infq_data_path[strlen(server.repl_infq_data_path) - 1] != '/') {
+        server.repl_infq_data_path = sdscat(server.repl_infq_data_path, "/");
+    }
+
+    server.repl_infq_temp_dir = sdscatprintf(sdsempty(), "%s%s/",
+            server.repl_infq_data_path, tmp_dir);
+    server.repl_infq_dir = sdscatprintf(sdsempty(), "%s%s/",
+            server.repl_infq_data_path, server.repl_infq_key);
+    redisLog(REDIS_DEBUG, "[INFQ] tmp dir: %s, dir: %s", server.repl_infq_temp_dir,
+            server.repl_infq_dir);
+    sdsfree(tmp_dir);
+
+    return REDIS_OK;
+}
+
+int readInfQFileHeader(int fd) {
+    char buf[4096];
+    sds line, *argv, path;
+    int argc;
+
+    if (syncReadLine(fd, buf, 1024, server.repl_syncio_timeout * 1000) == -1) {
+        redisLog(REDIS_WARNING,
+            "I/O error reading bulk count from MASTER: %s",
+            strerror(errno));
+        return REDIS_ERR;
+    }
+    if (checkReadBuf(buf) == REDIS_ERR) {
+        return REDIS_ERR;
+    }
+
+    line = sdsnewlen(buf + 1, strlen(buf + 1));
+    argv = sdssplitargs(line, &argc);
+    if (argv == NULL) {
+        redisLog(REDIS_WARNING, "failed to load InfQ Header");
+        return REDIS_ERR;
+    }
+    if (argc != 3) {
+        redisLog(REDIS_WARNING, "arg count error, expect 3, actual: %d", argc);
+        return REDIS_ERR;
+    }
+
+    server.repl_infq_file_prefix = sdsdup(argv[0]);
+    server.repl_infq_file_suffix = strtol(argv[1], NULL, 10);
+    server.repl_transfer_size = strtol(argv[2], NULL, 10);
+
+    // create tmp file according to prefix and suffix
+    path = sdscatprintf(sdsempty(), "%s%s_%d", server.repl_infq_temp_dir,
+            server.repl_infq_file_prefix, server.repl_infq_file_suffix);
+    server.repl_transfer_fd = open(path, O_CREAT | O_WRONLY | O_EXCL, 0644);
+    if (server.repl_transfer_fd == -1) {
+        redisLog(REDIS_WARNING, "failed to create temp file for MASTER <-> SLAVE, err: %s", strerror(errno));
+        return REDIS_ERR;
+    }
+    sdsfree(path);
+
+    return REDIS_OK;
+}
+
+void doneReadInfQFiles() {
+    // rename temp rdb and tmp InfQ dir
+    if (rename(server.repl_transfer_tmpfile,server.rdb_filename) == -1) {
+        redisLog(REDIS_WARNING,"Failed trying to rename the temp DB into dump.rdb in MASTER <-> SLAVE synchronization: %s", strerror(errno));
+        replicationAbortRecvInfQ();
+        return;
+    }
+    if (server.repl_infq_temp_dir != NULL) {
+        if (rename(server.repl_infq_temp_dir, server.repl_infq_dir) == -1) {
+            redisLog(REDIS_WARNING,"Failed trying to rename InfQ dir in MASTER <-> SLAVE synchronization: %s", strerror(errno));
+            replicationAbortRecvInfQ();
+            return;
+        }
+    }
+
+    signalFlushedDb(-1);
+    emptyDb(replicationEmptyDbCallback);
+    /* Before loading the DB into memory we need to delete the readable
+     * handler, otherwise it will get called recursively since
+     * rdbLoad() will call the event loop to process events from time to
+     * time for non blocking loading. */
+    aeDeleteFileEvent(server.el,server.repl_transfer_s,AE_READABLE);
+    redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: Loading DB in memory");
+    if (rdbLoad(server.rdb_filename) != REDIS_OK) {
+        redisLog(REDIS_WARNING,"Failed trying to load the MASTER synchronization DB from disk");
+        replicationAbortSyncTransfer();
+        return;
+    }
+    /* Final setup of the connected slave <- master link */
+    server.master = createClient(server.repl_transfer_s);
+    server.master->flags |= REDIS_MASTER;
+    server.master->authenticated = 1;
+    server.repl_state = REDIS_REPL_CONNECTED;
+    server.master->reploff = server.repl_master_initial_offset;
+    memcpy(server.master->replrunid, server.repl_master_runid,
+        sizeof(server.repl_master_runid));
+    /* If master offset is set to -1, this master is old and is not
+     * PSYNC capable, so we flag it accordingly. */
+    if (server.master->reploff == -1)
+        server.master->flags |= REDIS_PRE_PSYNC;
+    redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: Finished with success");
+    /* Restart the AOF subsystem now that we finished the sync. This
+     * will trigger an AOF rewrite, and when done will start appending
+     * to the new file. */
+    if (server.aof_state != REDIS_AOF_OFF) {
+        int retry = 10;
+
+        stopAppendOnly();
+        while (retry-- && startAppendOnly() == REDIS_ERR) {
+            redisLog(REDIS_WARNING,"Failed enabling the AOF after successful master synchronization! Trying it again in one second.");
+            sleep(1);
+        }
+        if (!retry) {
+            redisLog(REDIS_WARNING,"FATAL: this slave instance finished the synchronization with its master, but the AOF can't be turned on. Exiting now.");
+            exit(1);
+        }
+    }
+}
+
+void readInfQFiles(aeEventLoop *el, int fd, void *privdata, int mask) {
+    char buf[4096];
+    ssize_t nread, readlen;
+    off_t left, sync_size;
+    REDIS_NOTUSED(el);
+    REDIS_NOTUSED(privdata);
+    REDIS_NOTUSED(mask);
+
+    server.repl_transfer_lastio = server.unixtime;
+    // read InfQ Header: Data Path + InfQ Key + File Number
+    if (server.repl_infq_file_num == -1) {
+        if (readInfQHeader(fd) == REDIS_ERR) {
+            goto error;
+        }
+
+        /**
+         * NOTICE: No files of InfQ need to transfer
+         */
+        if (server.repl_infq_file_num == 0) {
+            doneReadInfQFiles();
+            return;
+        }
+        server.repl_transfer_size = -1;
+        server.repl_infq_file_cur_num = 0;
+        return;
+    }
+
+    // read: File Prefix + File Suffix + File Size
+    if (server.repl_transfer_size == -1) {
+        if (readInfQFileHeader(fd) == REDIS_ERR) {
+            goto error;
+        }
+        server.repl_transfer_read = 0;
+        server.repl_transfer_last_fsync_off = 0;
+        server.repl_infq_file_cur_num++;
+        return;
+    }
+
+    // read a file
+    left = server.repl_transfer_size - server.repl_transfer_read;
+    readlen = left > (signed)sizeof(buf) ? (signed)sizeof(buf) : left;
+    nread = read(fd, buf, readlen);
+    if (nread <= 0) {
+        redisLog(REDIS_WARNING, "I/O error for reading InfQ files when sync with Master: %s",
+                (nread == -1) ? strerror(errno) : "connection lost");
+        replicationAbortSyncTransfer();
+        return;
+    }
+    server.stat_net_input_bytes += nread;
+    server.repl_transfer_lastio = server.unixtime;
+    if (write(server.repl_transfer_fd, buf, nread) != nread) {
+        redisLog(REDIS_WARNING, "Write error or short write writing InfQ file needed for MASTER <-> Slave, err: %s",
+                strerror(errno));
+        goto error;
+    }
+    server.repl_transfer_read += nread;
+    if (server.repl_transfer_read >=
+        server.repl_transfer_last_fsync_off + REPL_MAX_WRITTEN_BEFORE_FSYNC)
+    {
+        sync_size = server.repl_transfer_read -
+                          server.repl_transfer_last_fsync_off;
+        rdb_fsync_range(server.repl_transfer_fd,
+            server.repl_transfer_last_fsync_off, sync_size);
+        server.repl_transfer_last_fsync_off += sync_size;
+    }
+
+    // read a whole file
+    if (server.repl_transfer_read == server.repl_transfer_size) {
+        redisLog(REDIS_NOTICE, "Finish reading a file of InfQ, key: %s, prefix: %s, suffix: %d",
+                server.repl_infq_key, server.repl_infq_file_prefix, server.repl_infq_file_suffix);
+        close(server.repl_transfer_fd);
+        server.repl_transfer_size = -1;
+
+        // read all files belong to InfQ
+        if (server.repl_infq_file_cur_num == server.repl_infq_file_num) {
+            doneReadInfQFiles();
+            return;
+        }
+    }
+
+error:
+    replicationAbortRecvInfQ();
+    return;
+}
+
 void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
     char buf[4096];
     ssize_t nread, readlen;
@@ -997,56 +1556,19 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
     }
 
     if (eof_reached) {
-        if (rename(server.repl_transfer_tmpfile,server.rdb_filename) == -1) {
-            redisLog(REDIS_WARNING,"Failed trying to rename the temp DB into dump.rdb in MASTER <-> SLAVE synchronization: %s", strerror(errno));
-            replicationAbortSyncTransfer();
-            return;
-        }
         redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: Flushing old data");
-        signalFlushedDb(-1);
-        emptyDb(replicationEmptyDbCallback);
-        /* Before loading the DB into memory we need to delete the readable
-         * handler, otherwise it will get called recursively since
-         * rdbLoad() will call the event loop to process events from time to
-         * time for non blocking loading. */
         aeDeleteFileEvent(server.el,server.repl_transfer_s,AE_READABLE);
-        redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: Loading DB in memory");
-        if (rdbLoad(server.rdb_filename) != REDIS_OK) {
-            redisLog(REDIS_WARNING,"Failed trying to load the MASTER synchronization DB from disk");
-            replicationAbortSyncTransfer();
-            return;
+        if (aeCreateFileEvent(server.el, fd, AE_READABLE, readInfQFiles ,NULL) == AE_ERR) {
+            redisLog(REDIS_WARNING,
+                "Can't create readable event for SYNC InfQ files: %s (fd=%d)",
+                strerror(errno),fd);
+            close(fd);
+            server.repl_transfer_s = -1;
+            server.repl_state = REDIS_REPL_CONNECT;
         }
-        /* Final setup of the connected slave <- master link */
-        zfree(server.repl_transfer_tmpfile);
-        close(server.repl_transfer_fd);
-        server.master = createClient(server.repl_transfer_s);
-        server.master->flags |= REDIS_MASTER;
-        server.master->authenticated = 1;
-        server.repl_state = REDIS_REPL_CONNECTED;
-        server.master->reploff = server.repl_master_initial_offset;
-        memcpy(server.master->replrunid, server.repl_master_runid,
-            sizeof(server.repl_master_runid));
-        /* If master offset is set to -1, this master is old and is not
-         * PSYNC capable, so we flag it accordingly. */
-        if (server.master->reploff == -1)
-            server.master->flags |= REDIS_PRE_PSYNC;
-        redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: Finished with success");
-        /* Restart the AOF subsystem now that we finished the sync. This
-         * will trigger an AOF rewrite, and when done will start appending
-         * to the new file. */
-        if (server.aof_state != REDIS_AOF_OFF) {
-            int retry = 10;
-
-            stopAppendOnly();
-            while (retry-- && startAppendOnly() == REDIS_ERR) {
-                redisLog(REDIS_WARNING,"Failed enabling the AOF after successful master synchronization! Trying it again in one second.");
-                sleep(1);
-            }
-            if (!retry) {
-                redisLog(REDIS_WARNING,"FATAL: this slave instance finished the synchronization with its master, but the AOF can't be turned on. Exiting now.");
-                exit(1);
-            }
-        }
+        server.repl_state = REDIS_REPL_RECV_INFQ;
+        server.repl_infq_file_num = -1;
+        server.repl_infq_temp_dir = NULL;
     }
 
     return;

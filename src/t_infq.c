@@ -41,11 +41,12 @@ void qpushCommand(redisClient *c) {
         if (!qobj) {
             qobj = createInfqObject(c->argv[1]);
             if (qobj == NULL) {
-                addReply(c, shared.err);
                 addReplyError(c, "failed to create infq");
                 return;
             }
             dbAdd(c->db,c->argv[1],qobj);
+            server.infq_key = sdsdup(c->argv[1]->ptr);
+            server.infq_db = c->db;
         }
 
         // push to infq
@@ -197,6 +198,9 @@ void qdelCommand(redisClient *c) {
     }
 
     infq_destroy(q->ptr);
+    sdsfree(server.infq_key);
+    server.infq_key = NULL;
+    server.infq_db = NULL;
 
     addReplyBulk(c, shared.ok);
     server.dirty++;

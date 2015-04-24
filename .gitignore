@@ -28,3 +28,4 @@ deps/lua/src/liblua.a
 *.dSYM
 tags
 infq_data*
+slave_test

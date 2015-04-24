@@ -562,6 +562,11 @@ typedef struct redisClient {
     /* Response buffer */
     int bufpos;
     char buf[REDIS_REPLY_CHUNK_BYTES];
+
+    /* InfQ replication */
+    listIter *repl_infq_file_iter;
+    const char* repl_infq_file_prefix;
+    int repl_infq_file_suffix;
 } redisClient;
 
 struct saveparam {
@@ -918,6 +923,21 @@ struct redisServer {
     int infq_popq_blocks_num;
     float infq_dump_blocks_usage; /* trigger dump job when blocks used exceed
                                      'infq_dump_blocks_usage'*/
+    /* TODO: just support one InfQ per instance */
+    sds infq_key; /* key which holds InfQ */
+    redisDb *infq_db; /* DB in which InfQ is stored */
+    /* a memory block shared by main process and rdb process,
+     * which is used by rdb subprocess to pass file meta info to main process*/
+    infq_file_meta_t *infq_file_meta; /* file meta info used to replication */
+    int repl_infq_file_num; /* files need to receive from master */
+    sds repl_infq_data_path;
+    sds repl_infq_dir;
+    sds repl_infq_key;
+    int repl_infq_file_cur_num;
+    sds repl_infq_file_prefix;
+    int repl_infq_file_suffix;
+    sds repl_infq_temp_dir;
+    list *repl_infq_files;
 };
 
 typedef struct pubsubPattern {
