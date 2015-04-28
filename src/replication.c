@@ -1122,7 +1122,7 @@ int make_sure_dirs(sds dir, sds sub_dir) {
     return ret;
 }
 
-void resetSds(sds *s) {
+void clearSds(sds *s) {
     if (*s != NULL) {
         sdsfree(*s);
         *s = NULL;
@@ -1139,11 +1139,11 @@ void replicationAbortRecvInfQ() {
     zfree(server.repl_transfer_tmpfile);
 
     // TODO: remove all temp files and dir
-    resetSds(&server.repl_infq_temp_dir);
-    resetSds(&server.repl_infq_key);
-    resetSds(&server.repl_infq_dir);
-    resetSds(&server.repl_infq_data_path);
-    resetSds(&server.repl_infq_file_prefix);
+    clearSds(&server.repl_infq_temp_dir);
+    clearSds(&server.repl_infq_key);
+    clearSds(&server.repl_infq_dir);
+    clearSds(&server.repl_infq_data_path);
+    clearSds(&server.repl_infq_file_prefix);
 
     server.repl_state = REDIS_REPL_CONNECT;
 }
@@ -1381,7 +1381,6 @@ void readInfQFiles(aeEventLoop *el, int fd, void *privdata, int mask) {
         return;
     }
     server.stat_net_input_bytes += nread;
-    server.repl_transfer_lastio = server.unixtime;
     if (write(server.repl_transfer_fd, buf, nread) != nread) {
         redisLog(REDIS_WARNING, "Write error or short write writing InfQ file needed for MASTER <-> Slave, err: %s",
                 strerror(errno));
@@ -1411,6 +1410,10 @@ void readInfQFiles(aeEventLoop *el, int fd, void *privdata, int mask) {
             return;
         }
     }
+
+    // 1) need to read the reset part of a file
+    // 2) need to read reset files
+    return;
 
 error:
     replicationAbortRecvInfQ();
@@ -1566,6 +1569,11 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
             server.repl_transfer_s = -1;
             server.repl_state = REDIS_REPL_CONNECT;
         }
+        clearSds(&server.repl_infq_data_path);
+        clearSds(&server.repl_infq_dir);
+        clearSds(&server.repl_infq_key);
+        clearSds(&server.repl_infq_temp_dir);
+        clearSds(&server.repl_infq_file_prefix);
         server.repl_state = REDIS_REPL_RECV_INFQ;
         server.repl_infq_file_num = -1;
         server.repl_infq_temp_dir = NULL;

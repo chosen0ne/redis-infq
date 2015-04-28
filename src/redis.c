@@ -1862,6 +1862,12 @@ void initServer(void) {
         exit(1);
     }
     server.repl_infq_files = NULL;
+    server.repl_infq_file_prefix = NULL;
+    server.repl_infq_dir = NULL;
+    server.repl_infq_temp_dir = NULL;
+    server.repl_infq_data_path = NULL;
+    server.repl_infq_file_num = -1;
+    server.repl_infq_file_cur_num = -1;
 
     /* Create the serverCron() time event, that's our main way to process
      * background operations. */

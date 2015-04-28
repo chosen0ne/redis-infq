@@ -197,9 +197,13 @@ void qdelCommand(redisClient *c) {
         return;
     }
 
-    infq_destroy(q->ptr);
-    sdsfree(server.infq_key);
-    server.infq_key = NULL;
+    if (dbDelete(c->db, c->argv[1])) {
+        server.dirty++;
+    }
+
+    if (server.infq_key != NULL) {
+        sdsfree(server.infq_key);
+    }
     server.infq_db = NULL;
 
     addReplyBulk(c, shared.ok);
