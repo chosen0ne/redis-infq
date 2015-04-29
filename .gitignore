@@ -29,3 +29,4 @@ deps/lua/src/liblua.a
 tags
 infq_data*
 slave_test
+redis_test.conf

@@ -699,7 +699,6 @@ int openAndFillState(redisClient *slave) {
     }
     slave->repldboff = 0;
     slave->repldbsize = buf.st_size;
-    slave->replstate = REDIS_REPL_SEND_INFQ;
 
     sdsfree(path);
 
@@ -748,7 +747,7 @@ void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
     }
 
     // File Header: File Prefix + File Suffix + File Size
-    if (slave->reploff == -1) {
+    if (slave->repldboff == -1) {
         sds file_header;
         listNode *node;
         struct infqFileInfo *finfo;
@@ -768,6 +767,9 @@ void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
         finfo = node->value;
         slave->repl_infq_file_prefix = finfo->prefix;
         slave->repl_infq_file_suffix = finfo->suffix;
+
+        redisLog(REDIS_DEBUG, "start to send InfQ file, prefix: %s, suffix: %d",
+                finfo->prefix, finfo->suffix);
 
         if (openAndFillState(slave) == REDIS_ERR) {
             freeClient(slave);
@@ -790,7 +792,7 @@ void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
         /* fall through to send file block */
     }
 
-    lseek(slave->repldbfd, slave->reploff, SEEK_SET);
+    lseek(slave->repldbfd, slave->repldboff, SEEK_SET);
     buflen = read(slave->repldbfd, buf, REDIS_IOBUF_LEN);
     if (buflen <= 0) {
         redisLog(REDIS_VERBOSE,"Read file error sending InfQ files to slave, "
@@ -814,7 +816,7 @@ void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
     // finish one file transfer
     if (slave->repldboff == slave->repldbsize) {
         close(slave->repldbfd);
-        slave->reploff = -1;
+        slave->repldboff = -1;
         slave->repldbfd = -1;
     }
 }
@@ -925,6 +927,8 @@ void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
             freeClient(slave);
             return;
         }
+        slave->replstate = REDIS_REPL_SEND_INFQ;
+        slave->repldboff = -1;
     }
 }
 
@@ -1155,7 +1159,7 @@ int readInfQHeader(int fd) {
 
     if (syncReadLine(fd, buf, 4096, server.repl_syncio_timeout * 1000) == -1) {
         redisLog(REDIS_WARNING,
-            "I/O error reading bulk count from MASTER: %s",
+            "I/O error reading InfQ header from MASTER: %s",
             strerror(errno));
         return REDIS_ERR;
     }
@@ -1237,7 +1241,7 @@ int readInfQFileHeader(int fd) {
 
     if (syncReadLine(fd, buf, 1024, server.repl_syncio_timeout * 1000) == -1) {
         redisLog(REDIS_WARNING,
-            "I/O error reading bulk count from MASTER: %s",
+            "I/O error reading InfQ file header from MASTER: %s",
             strerror(errno));
         return REDIS_ERR;
     }
@@ -1375,9 +1379,12 @@ void readInfQFiles(aeEventLoop *el, int fd, void *privdata, int mask) {
     readlen = left > (signed)sizeof(buf) ? (signed)sizeof(buf) : left;
     nread = read(fd, buf, readlen);
     if (nread <= 0) {
-        redisLog(REDIS_WARNING, "I/O error for reading InfQ files when sync with Master: %s",
+        redisLog(REDIS_WARNING, "I/O error for reading InfQ files when sync with Master, "
+                "prefix: %s, suffix: %d, err: %s",
+                server.repl_infq_file_prefix,
+                server.repl_infq_file_suffix,
                 (nread == -1) ? strerror(errno) : "connection lost");
-        replicationAbortSyncTransfer();
+        replicationAbortRecvInfQ();
         return;
     }
     server.stat_net_input_bytes += nread;
