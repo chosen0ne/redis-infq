@@ -78,6 +78,7 @@ static struct config {
     sds dbnumstr;
     char *tests;
     char *auth;
+    int use_fix_data;
 } config;
 
 typedef struct _client {
@@ -419,7 +420,7 @@ static int compareLatency(const void *a, const void *b) {
 
 static void showLatencyReport(void) {
     int i, curlat = 0;
-    float perc, reqpersec;
+    float perc, reqpersec, transfered_mb;
 
     reqpersec = (float)config.requests_finished/((float)config.totlatency/1000);
     if (!config.quiet && !config.csv) {
@@ -439,7 +440,13 @@ static void showLatencyReport(void) {
                 printf("%.2f%% <= %d milliseconds\n", perc, curlat);
             }
         }
-        printf("%.2f requests per second\n\n", reqpersec);
+        printf("%.2f requests per second\n", reqpersec);
+        if (config.use_fix_data) {
+            transfered_mb = config.requests_finished * config.datasize / 1024 / 1024.0;
+            printf("%.2f MB transfered\n", transfered_mb);
+            printf("%.2f MB per second\n", transfered_mb / (config.totlatency / 1000.0));
+        }
+        printf("\n");
     } else if (config.csv) {
         printf("\"%s\",\"%.2f\"\n", config.title, reqpersec);
     } else {
@@ -536,6 +543,8 @@ int parseOptions(int argc, const char **argv) {
         } else if (!strcmp(argv[i],"--help")) {
             exit_status = 0;
             goto usage;
+        } else if (!strcmp(argv[i], "-f")) {
+            config.use_fix_data = 1;
         } else {
             /* Assume the user meant to provide an option when the arg starts
              * with a dash. We're done otherwise and should use the remainder
@@ -574,7 +583,8 @@ usage:
 " -l                 Loop. Run the tests forever\n"
 " -t <tests>         Only run the comma separated list of tests. The test\n"
 "                    names are the same as the ones produced as output.\n"
-" -I                 Idle mode. Just open N idle connections and wait.\n\n"
+" -I                 Idle mode. Just open N idle connections and wait.\n"
+" -f                 Use fix data, data length is specified by -d\n\n"
 "Examples:\n\n"
 " Run the benchmark with the default configuration against 127.0.0.1:6379:\n"
 "   $ redis-benchmark\n\n"
@@ -690,11 +700,35 @@ int main(int argc, const char **argv) {
             title = sdscatlen(title, (char*)argv[i], strlen(argv[i]));
         }
 
+        sds fix_data = sdsempty();
+        const char **new_argv = NULL;
+
+        if (config.use_fix_data) {
+            title = sdscatlen(title, " ", 1);
+            title = sdscatprintf(title, "%dBytes", config.datasize);
+
+            // generate fix data lengthed by config.datasize
+            for (int j = 0; j < config.datasize; j++) {
+                fix_data = sdscatlen(fix_data, "0", 1);
+            }
+
+            argc++;
+            new_argv = malloc(sizeof(const char *) * argc);
+            for (int j = 0; j < argc - 1; j++) {
+                new_argv[j] = argv[j];
+            }
+            new_argv[argc - 1] = fix_data;
+            argv = new_argv;
+        }
+
         do {
             len = redisFormatCommandArgv(&cmd,argc,argv,NULL);
             benchmark(title,cmd,len);
             free(cmd);
         } while(config.loop);
+
+        sdsfree(fix_data);
+        if (new_argv != NULL) free(new_argv);
 
         return 0;
     }

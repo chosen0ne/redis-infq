@@ -1284,6 +1284,11 @@ void doneReadInfQFiles() {
         replicationAbortRecvInfQ();
         return;
     }
+
+    signalFlushedDb(-1);
+    // NOTICE: 先清空DB, 否则如果主从库持有相同key的InfQ时
+    //      从库rename数据文件夹时会失败
+    emptyDb(replicationEmptyDbCallback);
     if (server.repl_infq_temp_dir != NULL) {
         if (rename(server.repl_infq_temp_dir, server.repl_infq_dir) == -1) {
             redisLog(REDIS_WARNING,"Failed trying to rename InfQ dir in MASTER <-> SLAVE synchronization: %s", strerror(errno));
@@ -1292,8 +1297,6 @@ void doneReadInfQFiles() {
         }
     }
 
-    signalFlushedDb(-1);
-    emptyDb(replicationEmptyDbCallback);
     /* Before loading the DB into memory we need to delete the readable
      * handler, otherwise it will get called recursively since
      * rdbLoad() will call the event loop to process events from time to
@@ -1343,6 +1346,8 @@ void readInfQFiles(aeEventLoop *el, int fd, void *privdata, int mask) {
     REDIS_NOTUSED(el);
     REDIS_NOTUSED(privdata);
     REDIS_NOTUSED(mask);
+
+    redisAssert(server.repl_state == REDIS_REPL_RECV_INFQ);
 
     server.repl_transfer_lastio = server.unixtime;
     // read InfQ Header: Data Path + InfQ Key + File Number
