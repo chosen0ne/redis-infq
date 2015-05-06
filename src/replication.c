@@ -778,7 +778,7 @@ void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
         file_header = sdscatprintf(sdsempty(), "$%s %d %lld\r\n",
                 slave->repl_infq_file_prefix,
                 slave->repl_infq_file_suffix,
-                slave->repldbsize);
+                (long long)slave->repldbsize);
         nwritten = write(fd, file_header, sdslen(file_header));
         if (nwritten == -1) {
             redisLog(REDIS_VERBOSE,"Write error sending InfQ files header to slave, "

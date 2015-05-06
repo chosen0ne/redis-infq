@@ -91,7 +91,7 @@ void qpopCommand(redisClient *c) {
     }
 
     if (infq_pop_zero_cp(q->ptr, &dataptr, &size) == INFQ_ERR) {
-        redisLog(REDIS_WARNING, "failed to pop from infq, key: %s", c->argv[1]->ptr);
+        redisLog(REDIS_WARNING, "failed to pop from infq, key: %s", (char *)c->argv[1]->ptr);
         addReplyError(c, "failed to pop from infq");
         return;
     }
@@ -147,7 +147,8 @@ void qtopCommand(redisClient *c) {
     }
 
     if (infq_top_zero_cp(q->ptr, &data, &data_size) == INFQ_ERR) {
-        redisLog(REDIS_WARNING, "failed to fetch top from infq, key: %s", c->argv[1]->ptr);
+        redisLog(REDIS_WARNING, "failed to fetch top from infq, key: %s",
+                (char *)c->argv[1]->ptr);
         addReplyError(c, "failed to fetch top from infq");
         return;
     }
@@ -180,7 +181,7 @@ void qjpopCommand(redisClient *c) {
     }
 
     if (infq_just_pop(q->ptr) == INFQ_ERR) {
-        redisLog(REDIS_WARNING, "failed to just pop from infq, key: %s", c->argv[1]->ptr);
+        redisLog(REDIS_WARNING, "failed to just pop from infq, key: %s", (char *)c->argv[1]->ptr);
         addReplyError(c, "failed to jus pop from infq");
         return;
     }
