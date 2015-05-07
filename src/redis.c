@@ -3066,6 +3066,58 @@ sds genRedisInfoString(char *section) {
             }
         }
     }
+
+    if (allsections || defsections || !strcasecmp(section, "InfQ")) {
+        if (sections++) info = sdscat(info, "\r\n");
+
+        infq_t  *q;
+        if (server.infq_key == NULL) {
+            q = NULL;
+        } else {
+            robj key;
+            initStaticStringObject(key, server.infq_key);
+            robj *qobj = lookupKeyRead(server.infq_db, &key);
+            if (qobj == NULL || qobj->ptr == NULL) {
+                q = NULL;
+            } else {
+                q = qobj->ptr;
+            }
+        }
+
+        if (q == NULL) {
+            info = sdscatprintf(info,
+                    "# InfQ\r\n"
+                    "empty\r\n");
+        } else {
+            infq_stats_t    stats;
+            if (infq_fetch_stats(q, &stats) == INFQ_ERR) {
+                info = sdscatprintf(info,
+                        "#InfQ\r\n"
+                        "failed to fetch stats\r\n");
+            } else {
+                info = sdscatprintf(info,
+                        "# InfQ\r\n"
+                        "infQ_key:%s\r\n"
+                        "mem_size:%d\r\n"
+                        "file_size:%d\r\n"
+                        "mem_block_size:%d\r\n"
+                        "pushq_blocks_num:%d\r\n"
+                        "pushq_used_blocks:%d\r\n"
+                        "popq_blocks_num:%d\r\n"
+                        "popq_used_blocks:%d\r\n"
+                        "fileq_blocks_num:%d\r\n",
+                        server.infq_key,
+                        stats.mem_size,
+                        stats.file_size,
+                        stats.mem_block_size,
+                        stats.pushq_blocks_num,
+                        stats.pushq_used_blocks,
+                        stats.popq_blocks_num,
+                        stats.popq_used_blocks,
+                        stats.fileq_blocks_num);
+            }
+        }
+    }
     return info;
 }
 

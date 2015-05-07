@@ -85,8 +85,9 @@ void qpopCommand(redisClient *c) {
     int         size;
     robj        *obj, *q;
 
-    q = lookupKeyWriteOrReply(c, c->argv[1], shared.nullbulk);
+    q = lookupKeyWrite(c->db, c->argv[1]);
     if (q == NULL || checkType(c, q, REDIS_INFQ)) {
+        redisLog(REDIS_WARNING, "val is NULL or not a InfQ");
         return;
     }
 
@@ -98,12 +99,14 @@ void qpopCommand(redisClient *c) {
 
     if (size == 0) {
         addReply(c, shared.nullbulk);
+        redisLog(REDIS_WARNING, "infq is empty");
+        return;
     }
 
     s = sdsinit(dataptr, size);
     if (s == NULL) {
-        redisLog(REDIS_WARNING, "failed to convert raw buffer to sds in qpop");
-        addReplyError(c, "failed to pop from infq");
+        redisLog(REDIS_WARNING, "failed to convert raw buffer to sds in qpop, size: %d", size);
+        addReplyError(c, "failed to pop, as failed to convertion from buf to sds");
         return;
     }
 
@@ -245,6 +248,11 @@ void qatCommand(redisClient *c) {
         sds key = c->argv[1]->ptr;
         redisLog(REDIS_WARNING, "failed to call at of InfQ, key: %s, size: %ld, idx: %ld",
                 key, qlen, idx);
+        return;
+    }
+
+    if (data_size == 0) {
+        addReply(c, shared.nullbulk);
         return;
     }
 
