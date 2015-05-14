@@ -804,7 +804,9 @@ int rdbSaveBackground(char *filename) {
         }
 
         // pass file meta info of InfQ to parent
-        if (server.infq_file_meta != NULL) {
+        if (server.infq_file_meta != NULL && server.infq_key != NULL) {
+            redisAssert(server.infq_db != NULL);
+
             robj key;
             initStaticStringObject(key, server.infq_key);
             robj *q = lookupKeyRead(server.infq_db, &key);

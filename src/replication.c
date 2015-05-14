@@ -36,6 +36,7 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
 struct infqFileInfo {
     const char *prefix;
@@ -739,6 +740,7 @@ void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
                 // no need to transfer files
                 aeDeleteFileEvent(server.el, slave->fd, AE_WRITABLE);
                 putSlaveOnline(slave);
+                return;
             }
             /* fall through sending data. */
         } else {
@@ -1277,12 +1279,58 @@ int readInfQFileHeader(int fd) {
     return REDIS_OK;
 }
 
+int removeDir(char *dir) {
+    struct dirent   *dirp;
+    DIR             *d;
+    int             failed;
+    sds             path;
+
+    if ((d = opendir(dir)) == NULL) {
+        redisLog(REDIS_WARNING, "Failed to open dir, dir: %s", dir);
+        return REDIS_ERR;
+    }
+
+    failed = 0;
+    while ((dirp = readdir(d)) != NULL) {
+        if (!strcmp(dirp->d_name, ".") ||
+                !strcmp(dirp->d_name, "..")) {
+            continue;
+        }
+
+        path = sdscatprintf(sdsempty(), "%s/%s", dir, dirp->d_name);
+        if (unlink(path) == -1) {
+            redisLog(REDIS_WARNING, "Failed to unlink, path: %s, err: %s",
+                    path, strerror(errno));
+            failed = 1;
+            sdsfree(path);
+            break;
+        }
+        sdsfree(path);
+    }
+
+    if (closedir(d) == -1) {
+        redisLog(REDIS_WARNING, "Failed to close dir, dir: %s, err: %s",
+                dir, strerror(errno));
+        return REDIS_ERR;
+    }
+
+    return failed ? REDIS_ERR : REDIS_OK;
+}
+
 void doneReadInfQFiles() {
     // rename temp rdb and tmp InfQ dir
     if (rename(server.repl_transfer_tmpfile,server.rdb_filename) == -1) {
         redisLog(REDIS_WARNING,"Failed trying to rename the temp DB into dump.rdb in MASTER <-> SLAVE synchronization: %s", strerror(errno));
         replicationAbortRecvInfQ();
         return;
+    }
+
+    // clear old infq dir
+    if (access(server.repl_infq_dir, F_OK) == 0) {
+        // clear old infq dir
+        if (removeDir(server.repl_infq_dir) == REDIS_ERR) {
+            redisLog(REDIS_WARNING, "Failed to remove old infq dir, dir: %s", server.repl_infq_dir);
+        }
     }
 
     signalFlushedDb(-1);

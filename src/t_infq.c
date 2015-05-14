@@ -99,7 +99,7 @@ void qpopCommand(redisClient *c) {
 
     if (size == 0) {
         addReply(c, shared.nullbulk);
-        redisLog(REDIS_WARNING, "infq is empty");
+        redisLog(REDIS_WARNING, "infq is empty when qpop");
         return;
     }
 
@@ -153,6 +153,12 @@ void qtopCommand(redisClient *c) {
         redisLog(REDIS_WARNING, "failed to fetch top from infq, key: %s",
                 (char *)c->argv[1]->ptr);
         addReplyError(c, "failed to fetch top from infq");
+        return;
+    }
+
+    if (data_size == 0) {
+        addReply(c, shared.nullbulk);
+        redisLog(REDIS_WARNING, "infq is empty when qtop");
         return;
     }
 
