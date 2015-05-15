@@ -782,6 +782,28 @@ int rdbSaveBackground(char *filename) {
 
     if (server.rdb_child_pid != -1) return REDIS_ERR;
 
+    // check to see if InfQ object exists, make its push queue jump to next memory
+    // block if it exists
+    if (server.infq_key != NULL) {
+        redisAssert(server.infq_db != NULL);
+
+        robj key;
+        initStaticStringObject(key, server.infq_key);
+        robj *q = lookupKeyRead(server.infq_db, &key);
+        if (q == NULL) {
+            redisLog(REDIS_WARNING, "[FATAL]failed to fetch info by dict of key => db");
+            return REDIS_ERR;
+        } else if (q->type != REDIS_INFQ) {
+            redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
+            return REDIS_ERR;
+        } else {
+            if (infq_push_queue_jump(q->ptr) != INFQ_OK) {
+                redisLog(REDIS_WARNING, "[FATAL]failed to make a InfQ object's push queue jump to next block");
+                return REDIS_ERR;
+            }
+        }
+    }
+
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
 
