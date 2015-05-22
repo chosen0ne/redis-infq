@@ -120,6 +120,7 @@ void qpopCommand(redisClient *c) {
     }
 
     addReplyBulk(c, obj);
+    decrRefCount(obj);
     server.dirty++;
 }
 
@@ -179,6 +180,7 @@ void qtopCommand(redisClient *c) {
     }
 
     addReplyBulk(c, obj);
+    decrRefCount(obj);
 }
 
 void qjpopCommand(redisClient *c) {
@@ -279,6 +281,7 @@ void qatCommand(redisClient *c) {
     }
 
     addReplyBulk(c, obj);
+    decrRefCount(obj);
 }
 
 void qrangeCommand(redisClient *c) {
@@ -342,5 +345,6 @@ void qrangeCommand(redisClient *c) {
         rioInitWithBuffer(&r, s);
         obj = rdbLoadObject(REDIS_RDB_TYPE_STRING, &r);
         addReplyBulk(c, obj);
+        decrRefCount(obj);
     }
 }
