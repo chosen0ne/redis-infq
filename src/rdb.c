@@ -797,10 +797,6 @@ int rdbSaveBackground(char *filename) {
             redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
             return REDIS_ERR;
         } else {
-            if (infq_suspend_bg_exec(q->ptr, INFQ_UNLINK_BG_EXEC) != INFQ_OK) {
-                redisLog(REDIS_WARNING, "[FATAL]failed to suspend a InfQ object's background unlinker");
-                return REDIS_ERR;
-            }
             if (infq_push_queue_jump(q->ptr) != INFQ_OK) {
                 redisLog(REDIS_WARNING, "[FATAL]failed to make a InfQ object's push queue jump to next block");
                 return REDIS_ERR;
@@ -1476,24 +1472,6 @@ void backgroundSaveDoneHandler(int exitcode, int bysignal) {
     default:
         redisPanic("Unknown RDB child type.");
         break;
-    }
-    // continue the InfQ object's background unlinker, if any, which stopped
-    // before the rdb save
-    if (server.infq_key != NULL) {
-        redisAssert(server.infq_db != NULL);
-
-        robj key;
-        initStaticStringObject(key, server.infq_key);
-        robj *q = lookupKeyRead(server.infq_db, &key);
-        if (q == NULL) {
-            redisLog(REDIS_WARNING, "[FATAL]failed to fetch info by dict of key => db");
-        } else if (q->type != REDIS_INFQ) {
-            redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
-        } else {
-            if (infq_continue_bg_exec(q->ptr, INFQ_UNLINK_BG_EXEC) != INFQ_OK) {
-                redisLog(REDIS_WARNING, "[FATAL]failed to continue a InfQ object's background unlinker");
-            }
-        }
     }
 }
 
