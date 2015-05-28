@@ -596,6 +596,7 @@ int rdbSaveObject(rio *rdb, robj *o) {
         char    buf[1024];
         int     size;
 
+        redisLog(REDIS_DEBUG, "infq dump started ...");
         if (infq_dump(q, buf, 1024, &size) == INFQ_ERR) {
             redisLog(REDIS_WARNING, "failed to dump infq");
             return -1;
@@ -812,6 +813,7 @@ int rdbSaveBackground(char *filename) {
         int retval;
 
         /* Child */
+        redisLog(REDIS_DEBUG, "rdb started...");
         closeListeningSockets(0);
         redisSetProcTitle("redis-rdb-bgsave");
         retval = rdbSave(filename);
@@ -850,6 +852,7 @@ int rdbSaveBackground(char *filename) {
                         server.infq_file_meta->pop_blk_prefix);
             }
         }
+        redisLog(REDIS_DEBUG, "rdb stopped...");
         exitFromChild((retval == REDIS_OK) ? 0 : 1);
     } else {
         /* Parent */
