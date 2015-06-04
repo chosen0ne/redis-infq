@@ -348,3 +348,74 @@ void qrangeCommand(redisClient *c) {
         decrRefCount(obj);
     }
 }
+
+// pop from InfQ, push to List
+void qpoprpushCommand(redisClient *c) {
+    const void  *dataptr;
+    robj        *sobj, *value, *dobj, *touchedkey;
+    sds         s;
+    int         size;
+    rio         r;
+
+    // find InfQ
+    if ((sobj = lookupKeyWriteOrReply(c, c->argv[1], shared.nullbulk)) == NULL ||
+            checkType(c, sobj, REDIS_INFQ)) {
+        return;
+    }
+
+    if (infq_size(sobj->ptr) == 0) {
+        addReply(c, shared.nullbulk);
+        return;
+    }
+
+    dobj = lookupKeyWrite(c->db, c->argv[2]);
+    touchedkey = c->argv[1];
+
+    if (dobj && checkType(c, dobj, REDIS_LIST)) {
+        return;
+    }
+
+    // pop data
+    if (infq_pop_zero_cp(sobj->ptr, &dataptr, &size) == INFQ_ERR) {
+        redisLog(REDIS_WARNING, "failed to pop from infq, key: %s", (char *)touchedkey->ptr);
+        addReplyError(c, "failed to pop from InfQ");
+        return;
+    }
+
+    if (size == 0) {
+        addReply(c, shared.nullbulk);
+        redisLog(REDIS_WARNING, "InfQ is empty when pop, key: %s", (char *)touchedkey->ptr);
+        return;
+    }
+
+    s = sdsinit(dataptr, size);
+    if (s == NULL) {
+        redisLog(REDIS_WARNING, "failed to convert raw buffer to sds, size: %d", size);
+        addReplyError(c, "failed to qpoplpush, as failed to convert from buf to sds");
+        return;
+    }
+
+    // deserialization
+    rioInitWithBuffer(&r, s);
+    value = rdbLoadObject(REDIS_RDB_TYPE_STRING, &r);
+    if (value == NULL) {
+        redisLog(REDIS_WARNING, "failed to deserialize");
+        addReplyError(c, "failed to deserialize");
+        return;
+    }
+
+    incrRefCount(touchedkey);
+    if (dobj == NULL) {
+        dobj = createZiplistObject();
+        dbAdd(c->db, c->argv[2], dobj);
+    }
+    signalModifiedKey(c->db, c->argv[2]);
+    listTypePush(dobj, value, REDIS_TAIL);
+    notifyKeyspaceEvent(REDIS_NOTIFY_LIST, "rpush", c->argv[2], c->db->id);
+    addReplyBulk(c, value);
+
+    decrRefCount(value);
+    signalModifiedKey(c->db, touchedkey);
+    decrRefCount(touchedkey);
+    server.dirty++;
+}

@@ -292,7 +292,8 @@ struct redisCommand redisCommandTable[] = {
     {"qtop",qtopCommand,2,"rF",0,NULL,1,1,1,0,0},
     {"qdel",qdelCommand,2,"wF",0,NULL,1,1,1,0,0},
     {"qat",qatCommand,3,"r",0,NULL,1,1,1,0,0},
-    {"qrange",qrangeCommand,4,"r",0,NULL,1,1,1,0,0}
+    {"qrange",qrangeCommand,4,"r",0,NULL,1,1,1,0,0},
+    {"qpoprpush",qpoprpushCommand,3,"wm",0,NULL,1,2,1,0,0}
 };
 
 struct evictionPoolEntry *evictionPoolAlloc(void);
