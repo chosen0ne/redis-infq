@@ -454,37 +454,60 @@ int startBgsaveForReplication(void) {
     redisLog(REDIS_NOTICE,"Starting BGSAVE for SYNC with target: %s",
         server.repl_diskless_sync ? "slaves sockets" : "disk");
 
-    // check to see if InfQ object exists, suspend its background
-    // unlinker if it exists
-    if (server.infq_key != NULL) {
-        redisAssert(server.infq_db != NULL);
+    if (server.repl_diskless_sync) {
+        retval = rdbSaveToSlavesSockets();
+    } else {
+        // check to see if InfQ object exists, suspend its background
+        // unlinker if it exists
+        if (server.infq_key != NULL) {
+            redisAssert(server.infq_db != NULL);
 
-        robj key;
-        initStaticStringObject(key, server.infq_key);
-        robj *q = lookupKeyRead(server.infq_db, &key);
+            robj key;
+            initStaticStringObject(key, server.infq_key);
+            robj *q = lookupKeyRead(server.infq_db, &key);
 
-        if (q == NULL) {
-            redisLog(REDIS_WARNING, "[FATAL]failed to fetch info by dict of key => db");
-            return REDIS_ERR;
-        } else if (q->type != REDIS_INFQ) {
-            redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
-            return REDIS_ERR;
-        } else {
-            if (infq_suspend_bg_exec(q->ptr, INFQ_UNLINK_BG_EXEC) != INFQ_OK) {
-                redisLog(REDIS_WARNING, "[FATAL]failed to suspend a InfQ object's background unlinker");
+            if (q == NULL) {
+                redisLog(REDIS_WARNING, "[FATAL]failed to fetch info by dict of key => db");
                 return REDIS_ERR;
+            } else if (q->type != REDIS_INFQ) {
+                redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
+                return REDIS_ERR;
+            } else {
+                if (infq_suspend_bg_exec(q->ptr, INFQ_UNLINK_BG_EXEC) != INFQ_OK) {
+                    redisLog(REDIS_WARNING, "[FATAL]failed to suspend a InfQ object's background unlinker");
+                    return REDIS_ERR;
+                }
+            }
+        }
+
+        retval = rdbSaveBackground(server.rdb_filename);
+    }
+    /* Flush the script cache, since we need that slave differences are
+     * accumulated without requiring slaves to match our cached scripts. */
+    if (retval == REDIS_OK) {
+        replicationScriptCacheFlush();
+    } else {
+        if (!server.repl_diskless_sync) {
+            // continue the InfQ object's background unlinker, if any, which stopped
+            // before the rdb save for replication
+            if (server.infq_key != NULL) {
+                redisAssert(server.infq_db != NULL);
+
+                robj key;
+                initStaticStringObject(key, server.infq_key);
+                robj *q = lookupKeyRead(server.infq_db, &key);
+                if (q == NULL) {
+                    redisLog(REDIS_WARNING, "[FATAL]failed to fetch info by dict of key => db");
+                } else if (q->type != REDIS_INFQ) {
+                    redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
+                } else {
+                    if (infq_continue_bg_exec(q->ptr, INFQ_UNLINK_BG_EXEC) != INFQ_OK) {
+                        redisLog(REDIS_WARNING, "[FATAL]failed to continue a InfQ object's background unlinker");
+                    }
+                }
             }
         }
     }
-
-    if (server.repl_diskless_sync)
-        retval = rdbSaveToSlavesSockets();
-    else
-        retval = rdbSaveBackground(server.rdb_filename);
-
-    /* Flush the script cache, since we need that slave differences are
-     * accumulated without requiring slaves to match our cached scripts. */
-    if (retval == REDIS_OK) replicationScriptCacheFlush();
     return retval;
 }
 
