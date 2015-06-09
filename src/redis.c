@@ -1251,7 +1251,8 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
                 initStaticStringObject(key, server.infq_key);
                 robj *q = lookupKeyRead(server.infq_db, &key);
                 if (q == NULL) {
-                    redisLog(REDIS_WARNING, "[FATAL]failed to fetch info by dict of key => db");
+                    redisLog(REDIS_WARNING, "[FATAL]failed to fetch infq by infq_key in infq_db, key: %s",
+                            server.infq_key);
                 } else if (q->type != REDIS_INFQ) {
                     redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
                 } else {
