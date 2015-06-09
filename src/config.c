@@ -571,6 +571,8 @@ void loadServerConfigFromString(char *config) {
             server.infq_popq_blocks_num = atoi(argv[1]);
         } else if (!strcasecmp(argv[0], "infq-dump-blocks-usage")) {
             server.infq_dump_blocks_usage = atof(argv[1]);
+        } else if (!strcasecmp(argv[0], "infq-unlinker-check-period")) {
+            server.infq_unlinker_check_period = atoi(argv[1]);
         } else {
             err = "Bad directive or wrong number of arguments"; goto loaderr;
         }
