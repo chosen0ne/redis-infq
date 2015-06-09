@@ -1259,7 +1259,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
                 } else if (q->type != REDIS_INFQ) {
                     redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
                 } else {
-                    if (infq_continue_bg_exec(q->ptr, INFQ_UNLINK_BG_EXEC) != INFQ_OK) {
+                    if (infq_continue_bg_exec_if_suspended(q->ptr, INFQ_UNLINK_BG_EXEC) != INFQ_OK) {
                         redisLog(REDIS_WARNING, "[FATAL]failed to continue a InfQ object's background unlinker");
                     }
                 }
