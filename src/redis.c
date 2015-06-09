@@ -294,7 +294,9 @@ struct redisCommand redisCommandTable[] = {
     {"qat",qatCommand,3,"r",0,NULL,1,1,1,0,0},
     {"qrange",qrangeCommand,4,"r",0,NULL,1,1,1,0,0},
     {"qpoprpush",qpoprpushCommand,3,"wm",0,NULL,1,2,1,0,0},
-    {"qpoplpush",qpoplpushCommand,3,"wm",0,NULL,1,2,1,0,0}
+    {"qpoplpush",qpoplpushCommand,3,"wm",0,NULL,1,2,1,0,0},
+    {"lpopqpush",lpopqpushCommand,3,"wm",0,NULL,1,2,1,0,0},
+    {"rpopqpush",rpopqpushCommand,3,"wm",0,NULL,1,2,1,0,0}
 };
 
 struct evictionPoolEntry *evictionPoolAlloc(void);
@@ -1236,8 +1238,8 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             listRewind(server.slaves,&li);
             while((ln = listNext(&li))) {
                 redisClient *slave = ln->value;
-            
-                if (slave->replstate == REDIS_REPL_WAIT_BGSAVE_END || 
+
+                if (slave->replstate == REDIS_REPL_WAIT_BGSAVE_END ||
                     slave->replstate == REDIS_REPL_SEND_BULK ||
                     slave->replstate == REDIS_REPL_SEND_INFQ)
                 {

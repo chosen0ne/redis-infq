@@ -1581,6 +1581,8 @@ void qatCommand(redisClient *c);
 void qrangeCommand(redisClient *c);
 void qpoprpushCommand(redisClient *c);
 void qpoplpushCommand(redisClient *c);
+void rpopqpushCommand(redisClient *c);
+void lpopqpushCommand(redisClient *c);
 /* Support for InfQ */
 
 #if defined(__GNUC__)

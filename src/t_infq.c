@@ -16,16 +16,87 @@ unsigned long infqLength(robj *q) {
     }
 }
 
+robj* createInfQ(robj *key, redisDb *db) {
+    robj    *q;
+
+    q = createInfqObject(key);
+    if (q == NULL) {
+        redisLog(REDIS_WARNING, "failed to create InfQ, key: %s", (sds)key->ptr);
+        return NULL;
+    }
+
+    // add InfQ to DB
+    dbAdd(db, key, q);
+
+    if (server.infq_key != NULL) {
+        sdsfree(server.infq_key);
+    }
+    server.infq_key = sdsdup(key->ptr);
+    server.infq_db = db;
+
+    return q;
+}
+
+int pushObj(robj *qobj, robj *val) {
+    sds     s;
+    rio     r;
+    int     data_size, ret;
+    size_t  size;
+    void    *raw_data;
+
+    // serialize robj to raw buffer
+    s = sdsempty();
+    rioInitWithBuffer(&r, s);
+    data_size = rdbSaveObject(&r, val);
+
+    // NOTICE: memory address of sds is changed when the space is increased
+    s = r.io.buffer.ptr;
+    redisAssert((size_t)data_size == sdslen(s));
+
+    // fetch the start pointer which point to the sdshdr and the length of sdshdr and data
+    sdsraw(s, &raw_data, &size);
+    // NOTICE: avoid the copy from robj => buffer
+    ret = REDIS_OK;
+    if (infq_push(qobj->ptr, raw_data, size) == INFQ_ERR) {
+        redisLog(REDIS_WARNING, "failed to push infq, data: %s, len: %d", s, data_size);
+        ret = REDIS_ERR;
+    }
+
+    if (s != NULL) {
+        sdsfree(s);
+    }
+
+    return ret;
+}
+
+robj* deserialize(const void *dataptr, int size) {
+    sds     s;
+    rio     r;
+    robj    *obj;
+
+    s = sdsinit(dataptr, size);
+    if (s == NULL) {
+        redisLog(REDIS_WARNING, "failed to convert raw buffer to sds, size: %d", size);
+        return NULL;
+    }
+
+    // deserialize buffer to robj
+    rioInitWithBuffer(&r, s);
+    obj = rdbLoadObject(REDIS_RDB_TYPE_STRING, &r);
+    if (obj == NULL) {
+        redisLog(REDIS_WARNING, "failed to load from buffer");
+        return NULL;
+    }
+
+    return obj;
+}
+
 /*-----------------------------------------------------------------------------
  * infQ Commands
  *----------------------------------------------------------------------------*/
 
 void qpushCommand(redisClient *c) {
-    int         j, pushed, data_size;
-    sds         s;
-    rio         r;
-    void        *raw_data;
-    size_t      size;
+    int         j, pushed;
     robj        *qobj;
 
     pushed = 0;
@@ -39,39 +110,20 @@ void qpushCommand(redisClient *c) {
     for (j = 2; j < c->argc; j++) {
         c->argv[j] = tryObjectEncoding(c->argv[j]);
         if (!qobj) {
-            qobj = createInfqObject(c->argv[1]);
+            qobj = createInfQ(c->argv[1], c->db);
             if (qobj == NULL) {
                 addReplyError(c, "failed to create infq");
                 return;
             }
-            dbAdd(c->db,c->argv[1],qobj);
-            server.infq_key = sdsdup(c->argv[1]->ptr);
-            server.infq_db = c->db;
         }
 
-        // push to infq
-        // serialize robj to raw buffer
-        s = sdsempty();
-        rioInitWithBuffer(&r, s);
-        data_size = rdbSaveObject(&r, c->argv[j]);
-
-        // NOTICE: memory address of sds is changed when the space is increased
-        s = r.io.buffer.ptr;
-        redisAssert((size_t)data_size == sdslen(s));
-
-        // fetch the start pointer which point to the sdshdr and the length of sdshdr and data
-        sdsraw(s, &raw_data, &size);
-        // NOTICE: avoid the copy from robj => buffer
-        if (infq_push(qobj->ptr, raw_data, size) == INFQ_ERR) {
-            redisLog(REDIS_WARNING, "failed to push infq, data: %s, len: %d",
-                    s, data_size);
+        if (pushObj(qobj, c->argv[j]) == REDIS_ERR) {
+            redisLog(REDIS_WARNING, "failed to push InfQ, key: %s, value: %s",
+                    c->argv[1]->ptr, c->argv[j]->ptr);
             addReplyErrorFormat(c, "failed to push infq");
             return;
         }
 
-        if (s != NULL) {
-            sdsfree(s);
-        }
         pushed++;
     }
     addReplyLongLong(c, qobj ? infqLength(qobj) : 0);
@@ -80,8 +132,6 @@ void qpushCommand(redisClient *c) {
 
 void qpopCommand(redisClient *c) {
     const void  *dataptr;
-    sds         s;
-    rio         r;
     int         size;
     robj        *obj, *q;
 
@@ -103,18 +153,7 @@ void qpopCommand(redisClient *c) {
         return;
     }
 
-    s = sdsinit(dataptr, size);
-    if (s == NULL) {
-        redisLog(REDIS_WARNING, "failed to convert raw buffer to sds in qpop, size: %d", size);
-        addReplyError(c, "failed to pop, as failed to convertion from buf to sds");
-        return;
-    }
-
-    // deserialize buffer to robj
-    rioInitWithBuffer(&r, s);
-    obj = rdbLoadObject(REDIS_RDB_TYPE_STRING, &r);
-    if (obj == NULL) {
-        redisLog(REDIS_WARNING, "failed to deserialize");
+    if ((obj = deserialize(dataptr, size)) == NULL) {
         addReplyError(c, "failed to deserialize");
         return;
     }
@@ -141,9 +180,7 @@ void qlenCommand(redisClient *c) {
 void qtopCommand(redisClient *c) {
     const void      *data;
     robj            *q, *obj;
-    sds             s;
     int             data_size;
-    rio             r;
 
     q = lookupKeyWriteOrReply(c, c->argv[1], shared.nullbulk);
     if (q == NULL || checkType(c, q, REDIS_INFQ)) {
@@ -163,18 +200,7 @@ void qtopCommand(redisClient *c) {
         return;
     }
 
-    s = sdsinit(data, data_size);
-    if (s == NULL) {
-        redisLog(REDIS_WARNING, "failed to convert raw buffer to sds in qtop");
-        addReplyError(c, "failed to fetch pop from infq");
-        return;
-    }
-
-    // deserialize buffer to robj
-    rioInitWithBuffer(&r, s);
-    obj = rdbLoadObject(REDIS_RDB_TYPE_STRING, &r);
-    if (obj == NULL) {
-        redisLog(REDIS_WARNING, "failed to deserialize");
+    if ((obj = deserialize(data, data_size)) == NULL) {
         addReplyError(c, "failed to deserialize");
         return;
     }
@@ -216,6 +242,7 @@ void qdelCommand(redisClient *c) {
     if (server.infq_key != NULL) {
         sdsfree(server.infq_key);
     }
+    server.infq_key = NULL;
     server.infq_db = NULL;
 
     addReplyBulk(c, shared.ok);
@@ -227,8 +254,6 @@ void qatCommand(redisClient *c) {
     int         data_size;
     robj        *q, *obj;
     long        idx, qlen;
-    sds         s;
-    rio         r;
 
     if (getLongFromObjectOrReply(c, c->argv[2], &idx, "index must be a integer") != REDIS_OK) {
         return;
@@ -264,18 +289,7 @@ void qatCommand(redisClient *c) {
         return;
     }
 
-    s = sdsinit(data, data_size);
-    if (s == NULL) {
-        addReplyError(c, "failed to convert raw buffer to robj");
-        sds key = c->argv[1]->ptr;
-        redisLog(REDIS_WARNING, "failed to convert raw buffer to robj, key: %s", key);
-        return;
-    }
-
-    rioInitWithBuffer(&r, s);
-    obj = rdbLoadObject(REDIS_RDB_TYPE_STRING, &r);
-    if (obj == NULL) {
-        redisLog(REDIS_WARNING, "failed to deserialize");
+    if ((obj = deserialize(data, data_size)) == NULL) {
         addReplyError(c, "failed to deserialize");
         return;
     }
@@ -289,8 +303,6 @@ void qrangeCommand(redisClient *c) {
     int         data_size;
     robj        *q, *obj;
     long        qlen, start, end, rangelen;
-    sds         s;
-    rio         r;
 
     if ((getLongFromObjectOrReply(c, c->argv[2], &start, "start must be a integer") == REDIS_ERR)
             || (getLongFromObjectOrReply(c, c->argv[3], &end, "end must be a integer") == REDIS_ERR)) {
@@ -334,28 +346,27 @@ void qrangeCommand(redisClient *c) {
             return;
         }
 
-        s = sdsinit(data, data_size);
-        if (s == NULL) {
-            addReplyErrorFormat(c, "failed to fetch range data, cannot convert raw buffer");
-            sds key = c->argv[1]->ptr;
-            redisLog(REDIS_WARNING, "failed to fetch range of InfQ, key: %s, "
-                    "range: [%ld, %ld], idx: %d", key, start, end, i);
-            return;
+        if (data_size == 0) {
+            addReply(c, shared.nullbulk);
+            continue;
         }
-        rioInitWithBuffer(&r, s);
-        obj = rdbLoadObject(REDIS_RDB_TYPE_STRING, &r);
+
+        if ((obj = deserialize(data, data_size)) == NULL) {
+            redisLog(REDIS_WARNING, "failed to deserialize");
+            addReply(c, shared.nullbulk);
+            continue;
+        }
+
         addReplyBulk(c, obj);
         decrRefCount(obj);
     }
 }
 
 // pop from InfQ, push to List
-void poppushGeneric(redisClient *c, int where) {
+void qpopLpushGeneric(redisClient *c, int where) {
     const void  *dataptr;
     robj        *sobj, *value, *dobj, *touchedkey;
-    sds         s;
     int         size;
-    rio         r;
 
     // find InfQ
     if ((sobj = lookupKeyWriteOrReply(c, c->argv[1], shared.nullbulk)) == NULL ||
@@ -388,19 +399,8 @@ void poppushGeneric(redisClient *c, int where) {
         return;
     }
 
-    s = sdsinit(dataptr, size);
-    if (s == NULL) {
-        redisLog(REDIS_WARNING, "failed to convert raw buffer to sds, size: %d", size);
-        addReplyError(c, "failed to qpoplpush, as failed to convert from buf to sds");
-        return;
-    }
-
-    // deserialization
-    rioInitWithBuffer(&r, s);
-    value = rdbLoadObject(REDIS_RDB_TYPE_STRING, &r);
-    if (value == NULL) {
-        redisLog(REDIS_WARNING, "failed to deserialize");
-        addReplyError(c, "failed to deserialize");
+    if ((value = deserialize(dataptr, size)) == NULL) {
+        addReplyError(c, "failed to pop from InfQ");
         return;
     }
 
@@ -427,9 +427,76 @@ void poppushGeneric(redisClient *c, int where) {
 }
 
 void qpoprpushCommand(redisClient *c) {
-    poppushGeneric(c, REDIS_TAIL);
+    qpopLpushGeneric(c, REDIS_TAIL);
 }
 
 void qpoplpushCommand(redisClient *c) {
-    poppushGeneric(c, REDIS_HEAD);
+    qpopLpushGeneric(c, REDIS_HEAD);
 }
+
+// pop from List, push to List
+void lpopQpushGeneric(redisClient *c, int where) {
+    robj    *sobj, *value;
+
+    if ((sobj = lookupKeyReadOrReply(c, c->argv[1], shared.nullbulk)) == NULL ||
+            checkType(c, sobj, REDIS_LIST)) {
+        return;
+    }
+
+    if (listTypeLength(sobj) == 0) {
+        addReply(c, shared.nullbulk);
+        return;
+    }
+
+    robj *qobj = lookupKeyWrite(c->db, c->argv[2]);
+    robj *touchedkey = c->argv[1];
+
+    if (qobj && checkType(c, qobj, REDIS_INFQ)) {
+         return;
+    }
+
+    // create InfQ if needed
+    if (qobj == NULL) {
+        qobj = createInfQ(c->argv[2], c->db);
+        if (qobj == NULL) {
+             addReplyError(c, "failed to create infq");
+             return;
+        }
+    }
+
+    value = listTypePop(sobj, where);
+    incrRefCount(touchedkey);
+
+    if (pushObj(qobj, value) == REDIS_ERR) {
+         redisLog(REDIS_WARNING, "failed to pop list and push InfQ, key: %s, value: %s, where: %d",
+                 c->argv[2]->ptr, value->ptr, where);
+         addReplyErrorFormat(c, "failed to push infq");
+
+         // push value back to list
+         listTypePush(sobj, value, where);
+         return;
+    }
+
+    decrRefCount(value);
+    /* Delete the source list when it is empty */
+    notifyKeyspaceEvent(REDIS_NOTIFY_LIST,"rpop",touchedkey,c->db->id);
+    if (listTypeLength(sobj) == 0) {
+        dbDelete(c->db,touchedkey);
+        notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC,"del",
+                            touchedkey,c->db->id);
+    }
+
+    addReplyBulk(c, value);
+    signalModifiedKey(c->db,touchedkey);
+    decrRefCount(touchedkey);
+    server.dirty++;
+}
+
+void rpopqpushCommand(redisClient *c) {
+    lpopQpushGeneric(c, REDIS_TAIL);
+}
+
+void lpopqpushCommand(redisClient *c) {
+    lpopQpushGeneric(c, REDIS_HEAD);
+}
+
