@@ -350,7 +350,7 @@ void qrangeCommand(redisClient *c) {
 }
 
 // pop from InfQ, push to List
-void qpoprpushCommand(redisClient *c) {
+void poppushGeneric(redisClient *c, int where) {
     const void  *dataptr;
     robj        *sobj, *value, *dobj, *touchedkey;
     sds         s;
@@ -410,12 +410,26 @@ void qpoprpushCommand(redisClient *c) {
         dbAdd(c->db, c->argv[2], dobj);
     }
     signalModifiedKey(c->db, c->argv[2]);
-    listTypePush(dobj, value, REDIS_TAIL);
-    notifyKeyspaceEvent(REDIS_NOTIFY_LIST, "rpush", c->argv[2], c->db->id);
+
+    listTypePush(dobj, value, where);
+    if (where == REDIS_TAIL) {
+        notifyKeyspaceEvent(REDIS_NOTIFY_LIST, "rpush", c->argv[2], c->db->id);
+    } else {
+        notifyKeyspaceEvent(REDIS_NOTIFY_LIST, "lpush", c->argv[2], c->db->id);
+    }
+
     addReplyBulk(c, value);
 
     decrRefCount(value);
     signalModifiedKey(c->db, touchedkey);
     decrRefCount(touchedkey);
     server.dirty++;
+}
+
+void qpoprpushCommand(redisClient *c) {
+    poppushGeneric(c, REDIS_TAIL);
+}
+
+void qpoplpushCommand(redisClient *c) {
+    poppushGeneric(c, REDIS_HEAD);
 }
