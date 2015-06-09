@@ -119,7 +119,7 @@ void qpushCommand(redisClient *c) {
 
         if (pushObj(qobj, c->argv[j]) == REDIS_ERR) {
             redisLog(REDIS_WARNING, "failed to push InfQ, key: %s, value: %s",
-                    c->argv[1]->ptr, c->argv[j]->ptr);
+                    (sds)c->argv[1]->ptr, (sds)c->argv[j]->ptr);
             addReplyErrorFormat(c, "failed to push infq");
             return;
         }
@@ -469,7 +469,7 @@ void lpopQpushGeneric(redisClient *c, int where) {
 
     if (pushObj(qobj, value) == REDIS_ERR) {
          redisLog(REDIS_WARNING, "failed to pop list and push InfQ, key: %s, value: %s, where: %d",
-                 c->argv[2]->ptr, value->ptr, where);
+                 (sds)c->argv[2]->ptr, (sds)value->ptr, where);
          addReplyErrorFormat(c, "failed to push infq");
 
          // push value back to list
