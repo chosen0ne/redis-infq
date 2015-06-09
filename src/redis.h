@@ -923,6 +923,8 @@ struct redisServer {
     int infq_popq_blocks_num;
     float infq_dump_blocks_usage; /* trigger dump job when blocks used exceed
                                      'infq_dump_blocks_usage'*/
+    int infq_unlinker_check_period; /* period(seconds) for check and continue of suspended
+                                       unlinker */
     /* TODO: just support one InfQ per instance */
     sds infq_key; /* key which holds InfQ */
     redisDb *infq_db; /* DB in which InfQ is stored */

@@ -1224,6 +1224,44 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
          }
     }
 
+    // Check and continue the InfQ object's background unlinker, if any, which may be stopped
+    // before the rdb save for replication
+    run_with_period(server.infq_unlinker_check_period * 1000) {
+        if (!server.repl_diskless_sync && server.infq_key != NULL) {
+            listNode *ln;
+            listIter li;
+
+            // Check all the slaves to see if anyone is doing fullresync now
+            listRewind(server.slaves,&li);
+            while((ln = listNext(&li))) {
+                redisClient *slave = ln->value;
+            
+                if (slave->replstate == REDIS_REPL_WAIT_BGSAVE_END || 
+                    slave->replstate == REDIS_REPL_SEND_BULK ||
+                    slave->replstate == REDIS_REPL_SEND_INFQ)
+                {
+                    break;
+                }
+            }
+            // No fullresync, continue the InfQ object's background unlinker
+            if (ln == NULL) {
+                redisAssert(server.infq_db != NULL);
+
+                robj key;
+                initStaticStringObject(key, server.infq_key);
+                robj *q = lookupKeyRead(server.infq_db, &key);
+                if (q == NULL) {
+                    redisLog(REDIS_WARNING, "[FATAL]failed to fetch info by dict of key => db");
+                } else if (q->type != REDIS_INFQ) {
+                    redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
+                } else {
+                    if (infq_continue_bg_exec(q->ptr, INFQ_UNLINK_BG_EXEC) != INFQ_OK) {
+                        redisLog(REDIS_WARNING, "[FATAL]failed to continue a InfQ object's background unlinker");
+                    }
+                }
+            }
+        }
+    }
 
     /* AOF postponed flush: Try at every cron cycle if the slow fsync
      * completed. */
@@ -1566,6 +1604,7 @@ void initServerConfig(void) {
     server.infq_mem_block_size = 32 * 1024 * 1024;
     server.infq_dump_blocks_usage = 0.5;
     server.infq_file_meta = NULL;
+    server.infq_unlinker_check_period = 5;
 }
 
 /* This function will try to raise the max number of open files accordingly to
