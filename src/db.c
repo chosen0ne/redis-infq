@@ -284,7 +284,7 @@ void delCommand(redisClient *c) {
         expireIfNeeded(c->db,c->argv[j]);
 
         // make sure to reset attrs for InfQ
-        if (sdscmp(c->argv[j]->ptr, server.infq_key) == 0) {
+        if (server.infq_key != NULL && sdscmp(c->argv[j]->ptr, server.infq_key) == 0) {
             sdsfree(server.infq_key);
             server.infq_key = NULL;
             server.infq_db = NULL;
