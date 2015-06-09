@@ -936,8 +936,8 @@ struct redisServer {
     int repl_infq_file_cur_num;
     sds repl_infq_file_prefix;
     int repl_infq_file_suffix;
-    sds repl_infq_temp_dir;
-    list *repl_infq_files;
+    sds repl_infq_temp_dir; /* temporary directory to store InfQ files received from master */
+    list *repl_infq_files;  /* temporary store the files for master to send to slave */
 };
 
 typedef struct pubsubPattern {

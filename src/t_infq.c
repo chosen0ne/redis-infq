@@ -85,7 +85,7 @@ void qpopCommand(redisClient *c) {
     int         size;
     robj        *obj, *q;
 
-    q = lookupKeyWrite(c->db, c->argv[1]);
+    q = lookupKeyWriteOrReply(c, c->argv[1], shared.nullbulk);
     if (q == NULL || checkType(c, q, REDIS_INFQ)) {
         redisLog(REDIS_WARNING, "val is NULL or not a InfQ");
         return;
@@ -230,7 +230,7 @@ void qatCommand(redisClient *c) {
     sds         s;
     rio         r;
 
-    if (getLongFromObjectOrReply(c, c->argv[2], &idx, NULL) != REDIS_OK) {
+    if (getLongFromObjectOrReply(c, c->argv[2], &idx, "index must be a integer") != REDIS_OK) {
         return;
     }
 
@@ -292,8 +292,8 @@ void qrangeCommand(redisClient *c) {
     sds         s;
     rio         r;
 
-    if ((getLongFromObjectOrReply(c, c->argv[2], &start, NULL) == REDIS_ERR)
-            || (getLongFromObjectOrReply(c, c->argv[3], &end, NULL) == REDIS_ERR)) {
+    if ((getLongFromObjectOrReply(c, c->argv[2], &start, "start must be a integer") == REDIS_ERR)
+            || (getLongFromObjectOrReply(c, c->argv[3], &end, "end must be a integer") == REDIS_ERR)) {
         return;
     }
 

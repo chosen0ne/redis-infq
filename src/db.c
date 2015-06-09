@@ -282,6 +282,14 @@ void delCommand(redisClient *c) {
 
     for (j = 1; j < c->argc; j++) {
         expireIfNeeded(c->db,c->argv[j]);
+
+        // make sure to reset attrs for InfQ
+        if (sdscmp(c->argv[j]->ptr, server.infq_key) == 0) {
+            sdsfree(server.infq_key);
+            server.infq_key = NULL;
+            server.infq_db = NULL;
+        }
+
         if (dbDelete(c->db,c->argv[j])) {
             signalModifiedKey(c->db,c->argv[j]);
             notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC,

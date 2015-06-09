@@ -32,6 +32,9 @@
 #include "infq.h"
 #include <math.h>
 #include <ctype.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <fcntl.h>
 
 #ifdef __CYGWIN__
 #define strtold(a,b) ((long double)strtod((a),(b)))
@@ -244,6 +247,16 @@ robj *createInfqObject(robj *key) {
     char            buf[1024];
     int             ret, len;
     sds             s;
+
+    // make sure directory existence
+    if (access(server.infq_data_path, F_OK) == -1) {
+        redisLog(REDIS_NOTICE, "InfQ dir doesn't exist, create it, dir: %s", server.infq_data_path);
+        if (mkdirat(AT_FDCWD, server.infq_data_path, 0755) == -1) {
+            redisLog(REDIS_WARNING, "failed to create InfQ dir, dir: %s, err: %s",
+                    server.infq_data_path, strerror(errno));
+            return NULL;
+        }
+    }
 
     if (key != NULL) {
         if (key->type != REDIS_STRING) {
