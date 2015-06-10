@@ -443,6 +443,18 @@ need_full_resync:
     return REDIS_ERR;
 }
 
+int iter_infq_suspend_callback(infq_t *q, sds key, void *arg1, void *arg2) {
+    REDIS_NOTUSED(arg1);
+    REDIS_NOTUSED(arg2);
+
+    if (infq_suspend_bg_exec(q, INFQ_UNLINK_BG_EXEC) == INFQ_ERR) {
+        redisLog(REDIS_WARNING, "failed to suspend unlinker for infq, key: %s", key);
+        return REDIS_ERR;
+    }
+
+    return REDIS_OK;
+}
+
 /* Start a BGSAVE for replication goals, which is, selecting the disk or
  * socket target depending on the configuration, and making sure that
  * the script cache is flushed before to start.
@@ -459,25 +471,10 @@ int startBgsaveForReplication(void) {
     } else {
         // check to see if InfQ object exists, suspend its background
         // unlinker if it exists
-        if (server.infq_key != NULL) {
-            redisAssert(server.infq_db != NULL);
-
-            robj key;
-            initStaticStringObject(key, server.infq_key);
-            robj *q = lookupKeyRead(server.infq_db, &key);
-
-            if (q == NULL) {
-                redisLog(REDIS_WARNING, "[FATAL]failed to fetch infq by infq_key in infq_db, key: %s",
-                        server.infq_key);
+        if (dictSize(server.infq_metas) > 0) {
+            if (iterateInfQ(iter_infq_suspend_callback, NULL, NULL, 1) == REDIS_ERR) {
+                redisLog(REDIS_WARNING, "failed to suspend infq");
                 return REDIS_ERR;
-            } else if (q->type != REDIS_INFQ) {
-                redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
-                return REDIS_ERR;
-            } else {
-                if (infq_suspend_bg_exec(q->ptr, INFQ_UNLINK_BG_EXEC) != INFQ_OK) {
-                    redisLog(REDIS_WARNING, "[FATAL]failed to suspend a InfQ object's background unlinker");
-                    return REDIS_ERR;
-                }
             }
         }
 
@@ -487,29 +484,9 @@ int startBgsaveForReplication(void) {
      * accumulated without requiring slaves to match our cached scripts. */
     if (retval == REDIS_OK) {
         replicationScriptCacheFlush();
-    } else {
-        if (!server.repl_diskless_sync) {
-            // continue the InfQ object's background unlinker, if any, which stopped
-            // before the rdb save for replication
-            if (server.infq_key != NULL) {
-                redisAssert(server.infq_db != NULL);
-
-                robj key;
-                initStaticStringObject(key, server.infq_key);
-                robj *q = lookupKeyRead(server.infq_db, &key);
-                if (q == NULL) {
-                    redisLog(REDIS_WARNING, "[FATAL]failed to fetch infq by infq_key in infq_db, key: %s",
-                            server.infq_key);
-                } else if (q->type != REDIS_INFQ) {
-                    redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
-                } else {
-                    if (infq_continue_bg_exec(q->ptr, INFQ_UNLINK_BG_EXEC) != INFQ_OK) {
-                        redisLog(REDIS_WARNING, "[FATAL]failed to continue a InfQ object's background unlinker");
-                    }
-                }
-            }
-        }
     }
+    /* NOTICE: 在rdb失败的情况下，暂时不需要恢复unlinker，会有serverCron异步恢复 */
+
     return retval;
 }
 
@@ -725,26 +702,6 @@ void putSlaveOnline(redisClient *slave) {
     refreshGoodSlavesCount();
     redisLog(REDIS_NOTICE,"Synchronization with slave %s succeeded",
         replicationGetSlaveName(slave));
-
-    // continue the InfQ object's background unlinker, if any, which stopped
-    // before the rdb save for replication
-    if (server.infq_key != NULL) {
-        redisAssert(server.infq_db != NULL);
-
-        robj key;
-        initStaticStringObject(key, server.infq_key);
-        robj *q = lookupKeyRead(server.infq_db, &key);
-        if (q == NULL) {
-            redisLog(REDIS_WARNING, "[FATAL]failed to fetch infq by infq_key in infq_db, key: %s",
-                    server.infq_key);
-        } else if (q->type != REDIS_INFQ) {
-            redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
-        } else {
-            if (infq_continue_bg_exec(q->ptr, INFQ_UNLINK_BG_EXEC) != INFQ_OK) {
-                redisLog(REDIS_WARNING, "[FATAL]failed to continue a InfQ object's background unlinker");
-            }
-        }
-    }
 }
 
 int openAndFillState(redisClient *slave) {
@@ -804,7 +761,7 @@ void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
              *      那么值传输一个header，表明“不需要传输文件”，slave接收到这个Header后，
              *      会跳过接收文件的过程。
              */
-            if (server.infq_key == NULL || file_num == 0) {
+            if (dictSize(server.infq_keys) == 0 || file_num == 0) {
                 // no need to transfer files
                 aeDeleteFileEvent(server.el, slave->fd, AE_WRITABLE);
                 putSlaveOnline(slave);
@@ -958,11 +915,11 @@ void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
                 server.infq_file_meta->file_blk_start +
                 server.infq_file_meta->pop_blk_end - server.infq_file_meta->pop_blk_start;
         // InfQ Header
-        if (server.infq_key == NULL || file_num == 0) {
+        if (dictSize(server.infq_keys) == 0 || file_num == 0) {
             slave->replpreamble = sdsnewlen("$# # 0\r\n", 8);
         } else {
             slave->replpreamble = sdscatprintf(sdsempty(),"$%s %s %d\r\n",
-                    server.infq_key,
+                    "infq kye",
                     server.infq_file_meta->data_path,
                     file_num);
         }

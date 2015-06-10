@@ -5,6 +5,8 @@
  * @date    2015/03/26 18:00:51
  */
 
+#include <sys/mman.h>
+
 #include "redis.h"
 #include "infq.h"
 
@@ -16,8 +18,34 @@ unsigned long infqLength(robj *q) {
     }
 }
 
+void* createInfQMeta() {
+    void    *m;
+
+    if ((m = mmap(
+            NULL,
+            sizeof(infq_file_meta_t),
+            PROT_READ | PROT_WRITE,
+            MAP_ANON | MAP_SHARED,
+            -1,
+            0)) == MAP_FAILED) {
+        redisLog(REDIS_WARNING, "failed to create shared mem for infq meta, err: %s",
+                strerror(errno));
+        return NULL;
+    }
+
+    return m;
+}
+
 robj* createInfQ(robj *key, redisDb *db) {
-    robj    *q;
+    robj        *q;
+    void        *m;
+    dictEntry   *de;
+
+    // create shared mem for infq meta
+    if ((m = createInfQMeta()) == NULL) {
+        redisLog(REDIS_WARNING, "failed to create infq meta");
+        return NULL;
+    }
 
     q = createInfqObject(key);
     if (q == NULL) {
@@ -28,11 +56,10 @@ robj* createInfQ(robj *key, redisDb *db) {
     // add InfQ to DB
     dbAdd(db, key, q);
 
-    if (server.infq_key != NULL) {
-        sdsfree(server.infq_key);
-    }
-    server.infq_key = sdsdup(key->ptr);
-    server.infq_db = db;
+    // NOTICE: dbAdd时会拷贝key，此处复用该key
+    de = dictFind(db->dict, key->ptr);
+    dictAdd(server.infq_keys, dictGetKey(de), db);
+    dictAdd(server.infq_metas, dictGetKey(de), m);
 
     return q;
 }
@@ -98,6 +125,7 @@ robj* deserialize(const void *dataptr, int size) {
 void qpushCommand(redisClient *c) {
     int         j, pushed;
     robj        *qobj;
+    dictEntry   *de;
 
     pushed = 0;
     qobj = lookupKeyWrite(c->db, c->argv[1]);
@@ -110,6 +138,9 @@ void qpushCommand(redisClient *c) {
     for (j = 2; j < c->argc; j++) {
         c->argv[j] = tryObjectEncoding(c->argv[j]);
         if (!qobj) {
+            de = dictFind(server.infq_keys, c->argv[1]->ptr);
+            redisAssert(de == NULL);
+
             qobj = createInfQ(c->argv[1], c->db);
             if (qobj == NULL) {
                 addReplyError(c, "failed to create infq");
@@ -239,12 +270,6 @@ void qdelCommand(redisClient *c) {
         server.dirty++;
     }
 
-    if (server.infq_key != NULL) {
-        sdsfree(server.infq_key);
-    }
-    server.infq_key = NULL;
-    server.infq_db = NULL;
-
     addReplyBulk(c, shared.ok);
     server.dirty++;
 }
@@ -339,7 +364,7 @@ void qrangeCommand(redisClient *c) {
     addReplyMultiBulkLen(c, rangelen);
     for (int i = start; i <= end; i++) {
         if (infq_at_zero_cp(q->ptr, i, &data, &data_size) == INFQ_ERR) {
-            addReplyErrorFormat(c, "failed to fetch range data at %d", i);
+            addReply(c, shared.nullbulk);
             sds key = c->argv[1]->ptr;
             redisLog(REDIS_WARNING, "failed to fetch range of InfQ, key: %s, "
                     "range: [%ld, %ld], idx: %d", key, start, end, i);
@@ -436,7 +461,8 @@ void qpoplpushCommand(redisClient *c) {
 
 // pop from List, push to List
 void lpopQpushGeneric(redisClient *c, int where) {
-    robj    *sobj, *value;
+    robj        *sobj, *value;
+    dictEntry   *de;
 
     if ((sobj = lookupKeyReadOrReply(c, c->argv[1], shared.nullbulk)) == NULL ||
             checkType(c, sobj, REDIS_LIST)) {
@@ -457,6 +483,9 @@ void lpopQpushGeneric(redisClient *c, int where) {
 
     // create InfQ if needed
     if (qobj == NULL) {
+        de = dictFind(server.infq_keys, c->argv[2]->ptr);
+        redisAssert(de == NULL);
+
         qobj = createInfQ(c->argv[2], c->db);
         if (qobj == NULL) {
              addReplyError(c, "failed to create infq");

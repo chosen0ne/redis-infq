@@ -473,6 +473,15 @@ void dictSdsDestructor(void *privdata, void *val)
     sdsfree(val);
 }
 
+void dictInfqMetaDestructor(void *privdata, void *val)
+{
+    size_t  s = (size_t)privdata;
+
+    if (munmap(val, s) == -1) {
+        redisLog(REDIS_WARNING, "failed to munmap, err: %s", strerror(errno));
+    }
+}
+
 int dictObjKeyCompare(void *privdata, const void *key1,
         const void *key2)
 {
@@ -659,6 +668,15 @@ dictType replScriptCacheDictType = {
     dictSdsKeyCaseCompare,      /* key compare */
     dictSdsDestructor,          /* key destructor */
     NULL                        /* val destructor */
+};
+
+dictType infqMetaDictType = {
+    dictSdsHash,                /* hash function */
+    NULL,                       /* key dup */
+    NULL,                       /* val dup */
+    dictSdsKeyCompare,          /* key compare */
+    NULL,                       /* key destructor */
+    dictInfqMetaDestructor      /* val destructor */
 };
 
 int htNeedsResize(dict *dict) {
@@ -1058,6 +1076,19 @@ void updateCachedTime(void) {
     server.mstime = mstime();
 }
 
+int iter_infq_continue_unlinker(infq_t *q, sds key, void *arg1, void *arg2) {
+    REDIS_NOTUSED(key);
+    REDIS_NOTUSED(arg1);
+    REDIS_NOTUSED(arg2);
+
+    if (infq_continue_bg_exec_if_suspended(q, INFQ_UNLINK_BG_EXEC) == INFQ_ERR) {
+        redisLog(REDIS_WARNING, "failed to continue unlinker");
+        return REDIS_ERR;
+    }
+
+    return REDIS_OK;
+}
+
 /* This is our timer interrupt, called server.hz times per second.
  * Here is where we do a number of things that need to be done asynchronously.
  * For instance:
@@ -1076,7 +1107,6 @@ void updateCachedTime(void) {
  * so in order to throttle execution of things we want to do less frequently
  * a macro is used: run_with_period(milliseconds) { .... }
  */
-
 int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     int j;
     REDIS_NOTUSED(eventLoop);
@@ -1230,7 +1260,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     // Check and continue the InfQ object's background unlinker, if any, which may be stopped
     // before the rdb save for replication
     run_with_period(server.infq_unlinker_check_period * 1000) {
-        if (!server.repl_diskless_sync && server.infq_key != NULL) {
+        if (!server.repl_diskless_sync && dictSize(server.infq_keys) > 0) {
             listNode *ln;
             listIter li;
 
@@ -1248,21 +1278,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             }
             // No fullresync, continue the InfQ object's background unlinker
             if (ln == NULL) {
-                redisAssert(server.infq_db != NULL);
-
-                robj key;
-                initStaticStringObject(key, server.infq_key);
-                robj *q = lookupKeyRead(server.infq_db, &key);
-                if (q == NULL) {
-                    redisLog(REDIS_WARNING, "[FATAL]failed to fetch infq by infq_key in infq_db, key: %s",
-                            server.infq_key);
-                } else if (q->type != REDIS_INFQ) {
-                    redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
-                } else {
-                    if (infq_continue_bg_exec_if_suspended(q->ptr, INFQ_UNLINK_BG_EXEC) != INFQ_OK) {
-                        redisLog(REDIS_WARNING, "[FATAL]failed to continue a InfQ object's background unlinker");
-                    }
-                }
+                iterateInfQ(iter_infq_continue_unlinker, NULL, NULL, 0);
             }
         }
     }
@@ -1893,18 +1909,8 @@ void initServer(void) {
     server.repl_good_slaves_count = 0;
     updateCachedTime();
 
-    server.infq_key = NULL;
-    server.infq_file_meta = (infq_file_meta_t *)mmap(
-            NULL,
-            sizeof(infq_file_meta_t),
-            PROT_READ | PROT_WRITE,
-            MAP_ANON | MAP_SHARED,
-            -1,
-            0);
-    if (server.infq_file_meta == MAP_FAILED) {
-        redisLog(REDIS_WARNING, "failed to create shared memory, err: %s", strerror(errno));
-        exit(1);
-    }
+    server.infq_keys = dictCreate(&keyptrDictType, NULL);
+    server.infq_metas = dictCreate(&infqMetaDictType, (void *)sizeof(infq_file_meta_t));
     server.repl_infq_files = NULL;
     server.repl_infq_file_prefix = NULL;
     server.repl_infq_dir = NULL;
@@ -3114,51 +3120,43 @@ sds genRedisInfoString(char *section) {
     if (allsections || defsections || !strcasecmp(section, "InfQ")) {
         if (sections++) info = sdscat(info, "\r\n");
 
-        infq_t  *q;
-        if (server.infq_key == NULL) {
-            q = NULL;
-        } else {
-            robj key;
-            initStaticStringObject(key, server.infq_key);
-            robj *qobj = lookupKeyRead(server.infq_db, &key);
-            if (qobj == NULL || qobj->ptr == NULL) {
-                q = NULL;
-            } else {
-                q = qobj->ptr;
-            }
-        }
+        // show all InfQ keys and info
+        dictIterator    *di;
+        dictEntry       *de;
 
-        if (q == NULL) {
-            info = sdscatprintf(info,
-                    "# InfQ\r\n"
-                    "empty\r\n");
+        if (dictSize(server.infq_keys) == 0) {
+            info = sdscatprintf(info, "# InfQ\r\nempty\r\n");
         } else {
-            infq_stats_t    stats;
-            if (infq_fetch_stats(q, &stats) == INFQ_ERR) {
-                info = sdscatprintf(info,
-                        "#InfQ\r\n"
-                        "failed to fetch stats\r\n");
-            } else {
-                info = sdscatprintf(info,
-                        "# InfQ\r\n"
-                        "infQ_key:%s\r\n"
-                        "mem_size:%d\r\n"
-                        "file_size:%d\r\n"
-                        "mem_block_size:%d\r\n"
-                        "pushq_blocks_num:%d\r\n"
-                        "pushq_used_blocks:%d\r\n"
-                        "popq_blocks_num:%d\r\n"
-                        "popq_used_blocks:%d\r\n"
-                        "fileq_blocks_num:%d\r\n",
-                        server.infq_key,
-                        stats.mem_size,
-                        stats.file_size,
-                        stats.mem_block_size,
-                        stats.pushq_blocks_num,
+            info = sdscatprintf(info, "# InfQ\r\nmem_block_size:%d, pushq_blocks_num:%d, "
+                    "popq_blocks_num:%d\r\n",
+                    server.infq_mem_block_size,
+                    server.infq_pushq_blocks_num,
+                    server.infq_popq_blocks_num);
+            di = dictGetIterator(server.infq_keys);
+            while ((de = dictNext(di)) != NULL) {
+                robj            key, *qobj;
+                infq_stats_t    stats;
+
+                initStaticStringObject(key, dictGetKey(de));
+                qobj = lookupKeyRead(dictGetVal(de), &key);
+                if (qobj == NULL || qobj->ptr == NULL) {
+                    redisLog(REDIS_WARNING, "failed to fetch InfQ in infoCommand, key: %s",
+                            (char *)key.ptr);
+                    continue;
+                }
+
+                if (infq_fetch_stats(qobj->ptr, &stats) == INFQ_ERR) {
+                    info = sdscatprintf(info, "%s: Failed to fetch stats\r\n", (char *)key.ptr);
+                    continue;
+                }
+
+                info = sdscatprintf(info, "%s=[publks:%d, poblks:%d, fblks:%d, ms:%d, fs:%d]\r\n",
+                        (char *)key.ptr,
                         stats.pushq_used_blocks,
-                        stats.popq_blocks_num,
                         stats.popq_used_blocks,
-                        stats.fileq_blocks_num);
+                        stats.fileq_blocks_num,
+                        stats.mem_size,
+                        stats.file_size);
             }
         }
     }
@@ -3698,6 +3696,31 @@ void redisSetProcTitle(char *title) {
 #else
     REDIS_NOTUSED(title);
 #endif
+}
+
+int iterateInfQ(infq_iter_callback_t cb, void *arg1, void *arg2, int err_stop) {
+    dictIterator    *di;
+    dictEntry       *de;
+
+    if (dictSize(server.infq_keys) == 0) return REDIS_OK;
+
+    di = dictGetIterator(server.infq_keys);
+    while ((de = dictNext(di)) != NULL) {
+        robj    key, *qobj;
+
+        initStaticStringObject(key, dictGetKey(de));
+        qobj = lookupKeyRead(dictGetVal(de), &key);
+        redisAssert(qobj != NULL && qobj->type == REDIS_INFQ);
+
+        if (cb(qobj->ptr, key.ptr, arg1, arg2) == REDIS_ERR) {
+            redisLog(REDIS_WARNING, "failed to callback on InfQ, key: %s", (char *)key.ptr);
+            if (err_stop) {
+                return REDIS_ERR;
+            }
+        }
+    }
+
+    return REDIS_OK;
 }
 
 int main(int argc, char **argv) {
