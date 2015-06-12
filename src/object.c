@@ -751,6 +751,7 @@ char *strEncoding(int encoding) {
     case REDIS_ENCODING_INTSET: return "intset";
     case REDIS_ENCODING_SKIPLIST: return "skiplist";
     case REDIS_ENCODING_EMBSTR: return "embstr";
+    case REDIS_ENCODING_INFQ: return "infq";
     default: return "unknown";
     }
 }

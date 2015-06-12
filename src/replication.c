@@ -707,10 +707,15 @@ void putSlaveOnline(redisClient *slave) {
 int openAndFillState(redisClient *slave) {
     struct redis_stat buf;
     sds path = sdsempty();
+    infq_file_meta_t *fmeta;
+
+    fmeta = (infq_file_meta_t *)dictFetchValue(server.infq_metas, slave->repl_infq_cur_key);
+    // 'fmeta == NULL' never happens in normal case
+    redisAssert(fmeta != NULL);
 
     // TODO: support relative path
     path = sdscatprintf(path, "%s/%s_%d",
-            server.infq_file_meta->data_path,
+            fmeta->data_path,
             slave->repl_infq_file_prefix,
             slave->repl_infq_file_suffix);
     // NOTICE: each slave may open the file.
@@ -731,6 +736,54 @@ int openAndFillState(redisClient *slave) {
     return REDIS_OK;
 }
 
+void infq_files_free(void *val) {
+    if (val != NULL)
+        zfree(val);
+}
+
+void doneSendAllInfQ(redisClient *slave) {
+    if (slave->repl_infq_keys_iter != NULL) {
+        listReleaseIterator(slave->repl_infq_keys_iter);
+        slave->repl_infq_keys_iter = NULL;
+    }
+    slave->repl_infq_cur_key = NULL;
+    aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
+    putSlaveOnline(slave);
+}
+
+void doneSendOneInfQ(redisClient *slave) {
+    // free file iterator and file list
+    if (slave->repl_infq_file_iter != NULL) {
+        listReleaseIterator(slave->repl_infq_file_iter);
+        slave->repl_infq_file_iter = NULL;
+    }
+    listRelease(slave->repl_infq_files);
+    slave->repl_infq_cur_key = NULL;
+}
+
+void prepareSendInfQFiles(redisClient *slave, infq_file_meta_t *fmeta) {
+    slave->repl_infq_files = listCreate();
+    listSetFreeMethod(slave->repl_infq_files, infq_files_free);
+
+    // file blocks
+    for (int i = fmeta->file_blk_start; i < fmeta->file_blk_end; i++) {
+        struct infqFileInfo *f = zmalloc(sizeof(struct infqFileInfo));
+        f->prefix = fmeta->file_blk_prefix;
+        f->suffix = i;
+        listAddNodeTail(slave->repl_infq_files, f);
+    }
+    // pop blocks
+    for (int i = fmeta->pop_blk_start; i < fmeta->pop_blk_end; i++) {
+        struct infqFileInfo *f = zmalloc(sizeof(struct infqFileInfo));
+        f->prefix = fmeta->pop_blk_prefix;
+        f->suffix = i;
+        listAddNodeTail(slave->repl_infq_files, f);
+    }
+
+    slave->repl_infq_file_iter = listGetIterator(slave->repl_infq_files, AL_START_HEAD);
+    slave->repldboff = -1;
+}
+
 void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
     redisClient *slave = privdata;
     REDIS_NOTUSED(el);
@@ -738,7 +791,7 @@ void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
     char buf[REDIS_IOBUF_LEN];
     ssize_t nwritten, buflen;
 
-    // InfQ Header: Key + Data Path + File Number
+    // Header: infq_keys_to_send + InfQ Key Num
     if (slave->replpreamble) {
         nwritten = write(fd,slave->replpreamble,sdslen(slave->replpreamble));
         if (nwritten == -1) {
@@ -753,15 +806,12 @@ void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
             sdsfree(slave->replpreamble);
             slave->replpreamble = NULL;
 
-            int file_num = server.infq_file_meta->file_blk_end -
-                    server.infq_file_meta->file_blk_start +
-                    server.infq_file_meta->pop_blk_end - server.infq_file_meta->pop_blk_start;
             /**
              * NOTICE: 当redis中没有InfQ对象，或者存在InfQ对象但是不需传输文件，
              *      那么值传输一个header，表明“不需要传输文件”，slave接收到这个Header后，
              *      会跳过接收文件的过程。
              */
-            if (dictSize(server.infq_keys) == 0 || file_num == 0) {
+            if (dictSize(server.infq_keys) == 0) {
                 // no need to transfer files
                 aeDeleteFileEvent(server.el, slave->fd, AE_WRITABLE);
                 putSlaveOnline(slave);
@@ -773,21 +823,58 @@ void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
         }
     }
 
+    // prepare to send file of next InfQ key
+    // Header: InfQ key + Data Path + File Num
+    if (slave->repl_infq_cur_key == NULL) {
+        listNode            *node;
+        infq_file_meta_t    *fmeta;
+        int                 file_num;
+
+        node = listNext(slave->repl_infq_keys_iter);
+        // all InfQ keys have sent to slave, finish full replication
+        if (node == NULL) {
+            doneSendAllInfQ(slave);
+            return;
+        }
+        slave->repl_infq_cur_key = node->value;
+
+        // prepare all files belong the infq to send to slave
+        fmeta = (infq_file_meta_t *)dictFetchValue(server.infq_metas, slave->repl_infq_cur_key);
+        // 'fmeta == NULL' never happend in normal case
+        redisAssert(fmeta != NULL);
+
+        file_num = fmeta->file_blk_end - fmeta->file_blk_start +
+                fmeta->pop_blk_end - fmeta->pop_blk_start;
+        redisLog(REDIS_DEBUG, "start to send infq, key: %s, file num: %d",
+                slave->repl_infq_cur_key,
+                file_num);
+
+        if (file_num == 0) {
+            slave->replpreamble = sdsnew("$# # 0\r\n");
+            // no files to send, jump to next infq key
+            slave->repl_infq_cur_key = NULL;
+            return;
+        }
+
+        slave->replpreamble = sdscatprintf(sdsempty(), "$%s %s %d\r\n",
+                slave->repl_infq_cur_key,
+                fmeta->data_path,
+                file_num);
+        prepareSendInfQFiles(slave, fmeta);
+
+        return;
+    }
+
+    // open and send next file of current InfQ
     // File Header: File Prefix + File Suffix + File Size
     if (slave->repldboff == -1) {
-        sds file_header;
         listNode *node;
         struct infqFileInfo *finfo;
 
         node = listNext(slave->repl_infq_file_iter);
-        // all files are transfered to Slave
+        // files belong to current infq have sent to slave
         if (node == NULL) {
-            if (slave->repl_infq_file_iter != NULL) {
-                listReleaseIterator(slave->repl_infq_file_iter);
-                slave->repl_infq_file_iter = NULL;
-            }
-            aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
-            putSlaveOnline(slave);
+            doneSendOneInfQ(slave);
             return;
         }
 
@@ -795,44 +882,42 @@ void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
         slave->repl_infq_file_prefix = finfo->prefix;
         slave->repl_infq_file_suffix = finfo->suffix;
 
-        redisLog(REDIS_DEBUG, "start to send InfQ file, prefix: %s, suffix: %d",
-                finfo->prefix, finfo->suffix);
+        redisLog(REDIS_DEBUG, "start to send InfQ file, key: %s, prefix: %s, suffix: %d",
+                slave->repl_infq_cur_key,
+                finfo->prefix,
+                finfo->suffix);
 
         if (openAndFillState(slave) == REDIS_ERR) {
             freeClient(slave);
             return;
         }
-        file_header = sdscatprintf(sdsempty(), "$%s %d %lld\r\n",
+        slave->replpreamble = sdscatprintf(sdsempty(), "$%s %d %lld\r\n",
                 slave->repl_infq_file_prefix,
                 slave->repl_infq_file_suffix,
                 (long long)slave->repldbsize);
-        nwritten = write(fd, file_header, sdslen(file_header));
-        if (nwritten == -1) {
-            redisLog(REDIS_VERBOSE,"Write error sending InfQ files header to slave, "
-                    "prefix: %s, suffix: %d, err: %s",
-                    slave->repl_infq_file_prefix, slave->repl_infq_file_suffix, strerror(errno));
-            freeClient(slave);
-            return;
-        }
-        server.stat_net_output_bytes += nwritten;
-        sdsfree(file_header);
-        /* fall through to send file block */
+        return;
     }
 
     lseek(slave->repldbfd, slave->repldboff, SEEK_SET);
     buflen = read(slave->repldbfd, buf, REDIS_IOBUF_LEN);
     if (buflen <= 0) {
-        redisLog(REDIS_VERBOSE,"Read file error sending InfQ files to slave, "
-                "prefix: %s, suffix: %d, err: %s",
-                slave->repl_infq_file_prefix, slave->repl_infq_file_suffix, strerror(errno));
+        redisLog(REDIS_WARNING, "Read file error sending InfQ files to slave, "
+                "key: %s, prefix: %s, suffix: %d, err: %s",
+                slave->repl_infq_cur_key,
+                slave->repl_infq_file_prefix,
+                slave->repl_infq_file_suffix,
+                strerror(errno));
         freeClient(slave);
         return;
     }
     if ((nwritten = write(fd, buf, buflen)) == -1) {
         if (errno != EAGAIN) {
-            redisLog(REDIS_VERBOSE,"Write error sending InfQ file block to slave, "
-                    "prefix: %s, suffix: %d, err: %s",
-                    slave->repl_infq_file_prefix, slave->repl_infq_file_suffix, strerror(errno));
+            redisLog(REDIS_WARNING, "Write error sending InfQ file block to slave, "
+                    "key: %s, prefix: %s, suffix: %d, err: %s",
+                    slave->repl_infq_cur_key,
+                    slave->repl_infq_file_prefix,
+                    slave->repl_infq_file_suffix,
+                    strerror(errno));
             freeClient(slave);
             return;
         }
@@ -846,11 +931,6 @@ void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
         slave->repldboff = -1;
         slave->repldbfd = -1;
     }
-}
-
-void infq_files_free(void *val) {
-    if (val != NULL)
-        zfree(val);
 }
 
 void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -903,6 +983,9 @@ void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
     server.stat_net_output_bytes += nwritten;
     // finish rdb file transferring
     if (slave->repldboff == slave->repldbsize) {
+        dictIterator    *di;
+        dictEntry       *de;
+
         close(slave->repldbfd);
         slave->repldbfd = -1;
         aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
@@ -910,44 +993,11 @@ void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
         // start to transfer InfQ's files if the instance holds InfQ
         // file meta info of InfQ has loaded by rdb process
         // initial state of the slave client
-        slave->reploff = -1;
-        int file_num = server.infq_file_meta->file_blk_end -
-                server.infq_file_meta->file_blk_start +
-                server.infq_file_meta->pop_blk_end - server.infq_file_meta->pop_blk_start;
-        // InfQ Header
-        if (dictSize(server.infq_keys) == 0 || file_num == 0) {
-            slave->replpreamble = sdsnewlen("$# # 0\r\n", 8);
+        if (dictSize(server.infq_keys) == 0) {
+            slave->replpreamble = sdsnew("$infq_keys_to_send 0\r\n");
         } else {
-            slave->replpreamble = sdscatprintf(sdsempty(),"$%s %s %d\r\n",
-                    "infq kye",
-                    server.infq_file_meta->data_path,
-                    file_num);
-        }
-
-        // fetch all files need to transfer to Slave
-        if (server.repl_infq_files != NULL) {
-            listRelease(server.repl_infq_files);
-        }
-        if (file_num > 0) {
-            server.repl_infq_files = listCreate();
-            listSetFreeMethod(server.repl_infq_files, infq_files_free);
-
-            // file blocks
-            for (int i = server.infq_file_meta->file_blk_start; i < server.infq_file_meta->file_blk_end; i++) {
-                struct infqFileInfo *f = zmalloc(sizeof(struct infqFileInfo));
-                f->prefix = server.infq_file_meta->file_blk_prefix;
-                f->suffix = i;
-                listAddNodeTail(server.repl_infq_files, f);
-            }
-            // pop blocks
-            for (int i = server.infq_file_meta->pop_blk_start; i < server.infq_file_meta->pop_blk_end; i++) {
-                struct infqFileInfo *f = zmalloc(sizeof(struct infqFileInfo));
-                f->prefix = server.infq_file_meta->pop_blk_prefix;
-                f->suffix = i;
-                listAddNodeTail(server.repl_infq_files, f);
-            }
-
-            slave->repl_infq_file_iter = listGetIterator(server.repl_infq_files, AL_START_HEAD);
+            slave->replpreamble = sdscatprintf(sdsempty(), "$infq_keys_to_send %lu\r\n",
+                    dictSize(server.infq_keys));
         }
 
         if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE, sendInfQFilesToSlave, slave) == AE_ERR) {
@@ -956,6 +1006,22 @@ void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
         }
         slave->replstate = REDIS_REPL_SEND_INFQ;
         slave->repldboff = -1;
+        slave->reploff = -1;
+
+        // NOTICE: fetch the snapshot of current InfQs, avoid to add or remove InfQ
+        //      during the process of file transfer
+        // generate the list of infq keys which need to send to slave
+        if (server.repl_infq_keys != NULL) {
+            listRelease(server.repl_infq_keys);
+        }
+        server.repl_infq_keys = listCreate();
+        di = dictGetIterator(server.infq_keys);
+        while ((de = dictNext(di)) != NULL) {
+            listAddNodeTail(server.repl_infq_keys, dictGetKey(de));
+        }
+
+        // each slave has own process info of InfQ transfer
+        slave->repl_infq_keys_iter = listGetIterator(server.repl_infq_keys, AL_START_HEAD);
     }
 }
 
@@ -1179,6 +1245,49 @@ void replicationAbortRecvInfQ() {
     server.repl_state = REDIS_REPL_CONNECT;
 }
 
+int readInfQKeyNumHeader(int fd) {
+    char buf[4096];
+    sds line, *argv;
+    int argc;
+
+    if (syncReadLine(fd, buf, 4096, server.repl_syncio_timeout * 1000) == -1) {
+        redisLog(REDIS_WARNING,
+            "I/O error reading InfQ header from MASTER: %s",
+            strerror(errno));
+        return REDIS_ERR;
+    }
+
+    if (checkReadBuf(buf) == REDIS_ERR) {
+        return REDIS_ERR;
+    }
+
+    line = sdsnew(buf + 1);
+    argv = sdssplitargs(line, &argc);
+    if (argv == NULL) {
+        redisLog(REDIS_WARNING, "failed to load InfQ Header");
+        return REDIS_ERR;
+    }
+    if (argc != 2) {
+        redisLog(REDIS_WARNING, "arg count error, expect 2 args, actual: %d", argc);
+        return REDIS_ERR;
+    }
+
+    if (!sdscmp("infq_keys_to_send", argv[0])) {
+        redisLog(REDIS_WARNING, "not ad infq key header, it should starts with infq_keys_to_send, prefix: %s",
+                argv[0]);
+        return REDIS_ERR;
+    }
+
+    server.repl_infq_key_num = strtol(argv[1], NULL, 10);
+    sdsfreesplitres(argv, argc);
+    sdsfree(line);
+
+    redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: need sync %d InfQ",
+            server.repl_infq_key_num);
+
+    return REDIS_OK;
+}
+
 int readInfQHeader(int fd) {
     char buf[4096], *cp;
     sds line, *argv, tmp_dir;
@@ -1233,7 +1342,6 @@ int readInfQHeader(int fd) {
             server.repl_infq_file_num,
             server.repl_infq_data_path,
             server.repl_infq_key);
-    sdsfreesplitres(argv,argc);
 
     // make sure of Data_Path/Key dirs' existence
     tmp_dir = sdscatprintf(sdsempty(), "temp-%s-%d.%ld",
@@ -1256,7 +1364,9 @@ int readInfQHeader(int fd) {
             server.repl_infq_data_path, server.repl_infq_key);
     redisLog(REDIS_DEBUG, "[INFQ] tmp dir: %s, dir: %s", server.repl_infq_temp_dir,
             server.repl_infq_dir);
+    sdsfreesplitres(argv,argc);
     sdsfree(tmp_dir);
+    sdsfree(line);
 
     return REDIS_OK;
 }
@@ -1299,7 +1409,9 @@ int readInfQFileHeader(int fd) {
         redisLog(REDIS_WARNING, "failed to create temp file for MASTER <-> SLAVE, err: %s", strerror(errno));
         return REDIS_ERR;
     }
+    sdsfreesplitres(argv, argc);
     sdsfree(path);
+    sdsfree(line);
 
     return REDIS_OK;
 }
@@ -1342,14 +1454,7 @@ int removeDir(char *dir) {
     return failed ? REDIS_ERR : REDIS_OK;
 }
 
-void doneReadInfQFiles() {
-    // rename temp rdb and tmp InfQ dir
-    if (rename(server.repl_transfer_tmpfile,server.rdb_filename) == -1) {
-        redisLog(REDIS_WARNING,"Failed trying to rename the temp DB into dump.rdb in MASTER <-> SLAVE synchronization: %s", strerror(errno));
-        replicationAbortRecvInfQ();
-        return;
-    }
-
+void doneReadOneInfQFiles() {
     // clear old infq dir
     if (access(server.repl_infq_dir, F_OK) == 0) {
         // clear old infq dir
@@ -1358,10 +1463,6 @@ void doneReadInfQFiles() {
         }
     }
 
-    signalFlushedDb(-1);
-    // NOTICE: 先清空DB, 否则如果主从库持有相同key的InfQ时
-    //      从库rename数据文件夹时会失败
-    emptyDb(replicationEmptyDbCallback);
     if (server.repl_infq_temp_dir != NULL) {
         if (rename(server.repl_infq_temp_dir, server.repl_infq_dir) == -1) {
             redisLog(REDIS_WARNING,"Failed trying to rename InfQ dir in MASTER <-> SLAVE synchronization: %s", strerror(errno));
@@ -1369,6 +1470,25 @@ void doneReadInfQFiles() {
             return;
         }
     }
+
+    clearSds(&server.repl_infq_key);
+    clearSds(&server.repl_infq_data_path);
+    clearSds(&server.repl_infq_dir);
+    clearSds(&server.repl_infq_temp_dir);
+}
+
+void doneReadAllInfQFiles() {
+    // rename temp rdb and tmp InfQ dir
+    if (rename(server.repl_transfer_tmpfile,server.rdb_filename) == -1) {
+        redisLog(REDIS_WARNING,"Failed trying to rename the temp DB into dump.rdb in MASTER <-> SLAVE synchronization: %s", strerror(errno));
+        replicationAbortRecvInfQ();
+        return;
+    }
+
+    signalFlushedDb(-1);
+    // NOTICE: 先清空DB, 否则如果主从库持有相同key的InfQ时
+    //      从库rename数据文件夹时会失败
+    emptyDb(replicationEmptyDbCallback);
 
     /* Before loading the DB into memory we need to delete the readable
      * handler, otherwise it will get called recursively since
@@ -1423,17 +1543,39 @@ void readInfQFiles(aeEventLoop *el, int fd, void *privdata, int mask) {
     redisAssert(server.repl_state == REDIS_REPL_RECV_INFQ);
 
     server.repl_transfer_lastio = server.unixtime;
-    // read InfQ Header: Data Path + InfQ Key + File Number
+
+    // read Key Num Header: infq_keys_to_send + Key Num
+    if (server.repl_infq_key_num == -1) {
+        if (readInfQKeyNumHeader(fd) == REDIS_ERR) {
+            goto error;
+        }
+
+        // NOTICE: No files of InfQ need to transfer
+        if (server.repl_infq_key_num == 0) {
+            doneReadAllInfQFiles();
+            return;
+        }
+
+        server.repl_infq_file_num = -1;
+        return;
+    }
+
+    // read InfQ Header: InfQ Key + Data Path + File Number
     if (server.repl_infq_file_num == -1) {
+        if (server.repl_infq_cur_key_num == server.repl_infq_key_num) {
+            redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: finishing to receive all InfQ keys");
+            doneReadAllInfQFiles();
+            return;
+        }
+
         if (readInfQHeader(fd) == REDIS_ERR) {
             goto error;
         }
 
-        /**
-         * NOTICE: No files of InfQ need to transfer
-         */
+        // no files belong to current infq, process next infq
         if (server.repl_infq_file_num == 0) {
-            doneReadInfQFiles();
+            server.repl_infq_cur_key_num++;
+            server.repl_infq_file_num = -1;
             return;
         }
         server.repl_transfer_size = -1;
@@ -1458,7 +1600,8 @@ void readInfQFiles(aeEventLoop *el, int fd, void *privdata, int mask) {
     nread = read(fd, buf, readlen);
     if (nread <= 0) {
         redisLog(REDIS_WARNING, "I/O error for reading InfQ files when sync with Master, "
-                "prefix: %s, suffix: %d, err: %s",
+                "key: %s, prefix: %s, suffix: %d, err: %s",
+                server.repl_infq_key,
                 server.repl_infq_file_prefix,
                 server.repl_infq_file_suffix,
                 (nread == -1) ? strerror(errno) : "connection lost");
@@ -1482,16 +1625,23 @@ void readInfQFiles(aeEventLoop *el, int fd, void *privdata, int mask) {
         server.repl_transfer_last_fsync_off += sync_size;
     }
 
-    // read a whole file
+    // finish reading a whole file
     if (server.repl_transfer_read == server.repl_transfer_size) {
-        redisLog(REDIS_NOTICE, "Finish reading a file of InfQ, key: %s, prefix: %s, suffix: %d",
-                server.repl_infq_key, server.repl_infq_file_prefix, server.repl_infq_file_suffix);
+        redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: finishing to read a file of InfQ, key: %s, "
+                "prefix: %s, suffix: %d, size: %lld",
+                server.repl_infq_key,
+                server.repl_infq_file_prefix,
+                server.repl_infq_file_suffix,
+                server.repl_transfer_size);
         close(server.repl_transfer_fd);
         server.repl_transfer_size = -1;
+        clearSds(&server.repl_infq_file_prefix);
 
-        // read all files belong to InfQ
+        // read all files belong to current infq
         if (server.repl_infq_file_cur_num == server.repl_infq_file_num) {
-            doneReadInfQFiles();
+            server.repl_infq_cur_key_num++;
+            server.repl_infq_file_num = -1;
+            doneReadOneInfQFiles();
             return;
         }
     }
@@ -1661,7 +1811,8 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
         clearSds(&server.repl_infq_file_prefix);
         server.repl_state = REDIS_REPL_RECV_INFQ;
         server.repl_infq_file_num = -1;
-        server.repl_infq_temp_dir = NULL;
+        server.repl_infq_key_num = -1;
+        server.repl_infq_cur_key_num = 0;
     }
 
     return;

@@ -567,6 +567,9 @@ typedef struct redisClient {
     listIter *repl_infq_file_iter;
     const char* repl_infq_file_prefix;
     int repl_infq_file_suffix;
+    listIter *repl_infq_keys_iter; /* at the master, record the order of infq to send to slave */
+    sds repl_infq_cur_key;   /* at the master, specify the current infq to send to slave */
+    list *repl_infq_files;  /* temporary store the files for master to send to slave */
 } redisClient;
 
 struct saveparam {
@@ -929,8 +932,8 @@ struct redisServer {
     dict *infq_keys;  /* dict specify InfQ keys => DB(InfQ reside in) */
     /* a memory block shared by main process and rdb process,
      * which is used by rdb subprocess to pass file meta info to main process*/
-    infq_file_meta_t *infq_file_meta; /* file meta info used to replication */
     dict *infq_metas; /* InfQ keys => file meta */
+
     int repl_infq_file_num; /* files need to receive from master */
     sds repl_infq_data_path;
     sds repl_infq_dir;
@@ -939,7 +942,11 @@ struct redisServer {
     sds repl_infq_file_prefix;
     int repl_infq_file_suffix;
     sds repl_infq_temp_dir; /* temporary directory to store InfQ files received from master */
-    list *repl_infq_files;  /* temporary store the files for master to send to slave */
+    /* 去当前的infq keys的快照，不直接使用dictIterator，是为避免在向slave发送过程中，
+     * 会有新的infq添加，造成数据不一致 */
+    list *repl_infq_keys;   /* temporary store the infq keys for master to send to slave */
+    int repl_infq_key_num;  /* count of infq keys need to receive from master */
+    int repl_infq_cur_key_num;  /* count of infq key have received from master */
 };
 
 typedef struct pubsubPattern {
@@ -1586,6 +1593,7 @@ void qpoprpushCommand(redisClient *c);
 void qpoplpushCommand(redisClient *c);
 void rpopqpushCommand(redisClient *c);
 void lpopqpushCommand(redisClient *c);
+void qinspectCommand(redisClient *c);
 
 /* err_stop: 指定是否遇到某个infq回调失败，就返回错误 */
 int iterateInfQ(infq_iter_callback_t cb, void *arg1, void *arg2, int err_stop);

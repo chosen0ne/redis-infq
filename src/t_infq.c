@@ -529,3 +529,21 @@ void lpopqpushCommand(redisClient *c) {
     lpopQpushGeneric(c, REDIS_HEAD);
 }
 
+void qinspectCommand(redisClient *c) {
+    const char      *debug_info;
+    char            buf[2048];
+    robj            *qobj;
+
+    qobj = lookupKeyReadOrReply(c, c->argv[1], shared.nullbulk);
+    if (qobj == NULL || checkType(c, qobj, REDIS_INFQ)) {
+        return;
+    }
+
+    if ((debug_info = infq_debug_info(qobj->ptr, buf, 2048)) == NULL) {
+        addReply(c, shared.nullbulk);
+        return;
+    }
+
+    addReplyBulkCString(c, buf);
+}
+

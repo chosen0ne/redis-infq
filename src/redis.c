@@ -296,7 +296,8 @@ struct redisCommand redisCommandTable[] = {
     {"qpoprpush",qpoprpushCommand,3,"wm",0,NULL,1,2,1,0,0},
     {"qpoplpush",qpoplpushCommand,3,"wm",0,NULL,1,2,1,0,0},
     {"lpopqpush",lpopqpushCommand,3,"wm",0,NULL,1,2,1,0,0},
-    {"rpopqpush",rpopqpushCommand,3,"wm",0,NULL,1,2,1,0,0}
+    {"rpopqpush",rpopqpushCommand,3,"wm",0,NULL,1,2,1,0,0},
+    {"qinspect",qinspectCommand,2,"rF",0,NULL,1,1,1,0,0}
 };
 
 struct evictionPoolEntry *evictionPoolAlloc(void);
@@ -1623,7 +1624,6 @@ void initServerConfig(void) {
     server.infq_pushq_blocks_num = 20;
     server.infq_mem_block_size = 32 * 1024 * 1024;
     server.infq_dump_blocks_usage = 0.5;
-    server.infq_file_meta = NULL;
     server.infq_unlinker_check_period = 5;
 }
 
@@ -1911,13 +1911,15 @@ void initServer(void) {
 
     server.infq_keys = dictCreate(&keyptrDictType, NULL);
     server.infq_metas = dictCreate(&infqMetaDictType, (void *)sizeof(infq_file_meta_t));
-    server.repl_infq_files = NULL;
     server.repl_infq_file_prefix = NULL;
     server.repl_infq_dir = NULL;
     server.repl_infq_temp_dir = NULL;
     server.repl_infq_data_path = NULL;
     server.repl_infq_file_num = -1;
     server.repl_infq_file_cur_num = -1;
+    server.repl_infq_keys = NULL;
+    server.repl_infq_key_num = -1;
+    server.repl_infq_cur_key_num = -1;
 
     /* Create the serverCron() time event, that's our main way to process
      * background operations. */

@@ -124,6 +124,9 @@ redisClient *createClient(int fd) {
     c->repl_infq_file_iter = NULL;
     c->repl_infq_file_prefix = NULL;
     c->repl_infq_file_suffix = -1;
+    c->repl_infq_keys_iter = NULL;
+    c->repl_infq_cur_key = NULL;
+    c->repl_infq_files = NULL;
     listSetFreeMethod(c->pubsub_patterns,decrRefCountVoid);
     listSetMatchMethod(c->pubsub_patterns,listMatchObjects);
     if (fd != -1) listAddNodeTail(server.clients,c);
