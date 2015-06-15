@@ -97,7 +97,7 @@ void dbAdd(redisDb *db, robj *key, robj *val) {
     redisAssertWithInfo(NULL,key,retval == REDIS_OK);
     if (val->type == REDIS_LIST) signalListAsReady(db, key);
     if (server.cluster_enabled) slotToKeyAdd(key);
- }
+}
 
 /* Overwrite an existing key with a new value. Incrementing the reference
  * count of the new value is up to the caller.
@@ -221,6 +221,13 @@ long long emptyDb(void(callback)(void*)) {
         dictEmpty(server.db[j].dict,callback);
         dictEmpty(server.db[j].expires,callback);
     }
+
+    // clear old status of InfQ
+    if (server.infq_keys != NULL || server.infq_metas != NULL) {
+        dictEmpty(server.infq_keys, callback);
+        dictEmpty(server.infq_metas, callback);
+    }
+
     if (server.cluster_enabled) slotToKeyFlush();
     return removed;
 }

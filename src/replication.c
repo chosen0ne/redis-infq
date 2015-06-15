@@ -702,6 +702,9 @@ void putSlaveOnline(redisClient *slave) {
     refreshGoodSlavesCount();
     redisLog(REDIS_NOTICE,"Synchronization with slave %s succeeded",
         replicationGetSlaveName(slave));
+
+    // Make the slave finish recv InfQ files at once
+    addReplyBulkCString(slave, "\n");
 }
 
 int openAndFillState(redisClient *slave) {
@@ -1456,11 +1459,16 @@ int removeDir(char *dir) {
 
 void doneReadOneInfQFiles() {
     // clear old infq dir
+    long long   t1, t2, t3;
+
+    t1 = ustime();
     if (access(server.repl_infq_dir, F_OK) == 0) {
+        t2 = ustime();
         // clear old infq dir
         if (removeDir(server.repl_infq_dir) == REDIS_ERR) {
             redisLog(REDIS_WARNING, "Failed to remove old infq dir, dir: %s", server.repl_infq_dir);
         }
+        t3 = ustime();
     }
 
     if (server.repl_infq_temp_dir != NULL) {
@@ -1471,6 +1479,13 @@ void doneReadOneInfQFiles() {
         }
     }
 
+    redisLog(REDIS_DEBUG, "finish to rename temporary dir of a InfQ, key: %s, access: %lld, "
+            "remove dir: %lld, rename: %lld",
+            server.repl_infq_key,
+            t2 - t1,
+            t3 - t2,
+            ustime() - t3);
+
     clearSds(&server.repl_infq_key);
     clearSds(&server.repl_infq_data_path);
     clearSds(&server.repl_infq_dir);
@@ -1478,6 +1493,7 @@ void doneReadOneInfQFiles() {
 }
 
 void doneReadAllInfQFiles() {
+    redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: finishing to receive all InfQ keys");
     // rename temp rdb and tmp InfQ dir
     if (rename(server.repl_transfer_tmpfile,server.rdb_filename) == -1) {
         redisLog(REDIS_WARNING,"Failed trying to rename the temp DB into dump.rdb in MASTER <-> SLAVE synchronization: %s", strerror(errno));
@@ -1563,7 +1579,6 @@ void readInfQFiles(aeEventLoop *el, int fd, void *privdata, int mask) {
     // read InfQ Header: InfQ Key + Data Path + File Number
     if (server.repl_infq_file_num == -1) {
         if (server.repl_infq_cur_key_num == server.repl_infq_key_num) {
-            redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: finishing to receive all InfQ keys");
             doneReadAllInfQFiles();
             return;
         }

@@ -58,8 +58,8 @@ robj* createInfQ(robj *key, redisDb *db) {
 
     // NOTICE: dbAdd时会拷贝key，此处复用该key
     de = dictFind(db->dict, key->ptr);
-    dictAdd(server.infq_keys, dictGetKey(de), db);
-    dictAdd(server.infq_metas, dictGetKey(de), m);
+    dictReplace(server.infq_keys, dictGetKey(de), db);
+    dictReplace(server.infq_metas, dictGetKey(de), m);
 
     return q;
 }

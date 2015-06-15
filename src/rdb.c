@@ -1293,7 +1293,7 @@ int rdbLoad(char *filename) {
         if (type == REDIS_RDB_TYPE_INFQ) {
             dictEntry   *de;
             de = dictFind(db->dict, key->ptr);
-            dictAdd(server.infq_keys, dictGetKey(de), db);
+            dictReplace(server.infq_keys, dictGetKey(de), db);
 
             // init infq file meta
             if (dictFetchValue(server.infq_metas, key->ptr) == NULL) {
@@ -1302,7 +1302,7 @@ int rdbLoad(char *filename) {
                     redisLog(REDIS_WARNING, "failed to create infq meta");
                     return REDIS_ERR;
                 }
-                dictAdd(server.infq_metas, dictGetKey(de), m);
+                dictReplace(server.infq_metas, dictGetKey(de), m);
             }
             redisLog(REDIS_DEBUG, "load infq from rdb key: %s", (char *)key->ptr);
         }
