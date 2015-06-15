@@ -848,7 +848,7 @@ void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
 
         file_num = fmeta->file_blk_end - fmeta->file_blk_start +
                 fmeta->pop_blk_end - fmeta->pop_blk_start;
-        redisLog(REDIS_DEBUG, "start to send infq, key: %s, file num: %d",
+        redisLog(REDIS_DEBUG, "start to send InfQ, key: %s, file num: %d",
                 slave->repl_infq_cur_key,
                 file_num);
 
