@@ -5,10 +5,10 @@
  * @date    2015/03/26 18:00:51
  */
 
-#include <sys/mman.h>
-
 #include "redis.h"
 #include "infq.h"
+
+#include <sys/mman.h>
 
 unsigned long infqLength(robj *q) {
     if (q->encoding == REDIS_ENCODING_INFQ) {
