@@ -149,8 +149,7 @@ void qpushCommand(redisClient *c) {
         }
 
         if (pushObj(qobj, c->argv[j]) == REDIS_ERR) {
-            redisLog(REDIS_WARNING, "failed to push InfQ, key: %s, value: %s",
-                    (sds)c->argv[1]->ptr, (sds)c->argv[j]->ptr);
+            redisLog(REDIS_WARNING, "failed to push InfQ, key: %s", (sds)c->argv[1]->ptr);
             addReplyErrorFormat(c, "failed to push infq");
             return;
         }
