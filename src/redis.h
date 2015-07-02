@@ -928,7 +928,8 @@ struct redisServer {
                                      'infq_dump_blocks_usage'*/
     int infq_unlinker_check_period; /* period(seconds) for check and continue of suspended
                                        unlinker */
-    /* TODO: just support one InfQ per instance */
+
+    /* Replication for InfQ */
     dict *infq_keys;  /* dict specify InfQ keys => DB(InfQ reside in) */
     /* a memory block shared by main process and rdb process,
      * which is used by rdb subprocess to pass file meta info to main process*/
@@ -942,11 +943,16 @@ struct redisServer {
     sds repl_infq_file_prefix;
     int repl_infq_file_suffix;
     sds repl_infq_temp_dir; /* temporary directory to store InfQ files received from master */
-    /* 去当前的infq keys的快照，不直接使用dictIterator，是为避免在向slave发送过程中，
+    /* 取当前的infq keys的快照，不直接使用dictIterator，是为避免在向slave发送过程中，
      * 会有新的infq添加，造成数据不一致 */
     list *repl_infq_keys;   /* temporary store the infq keys for master to send to slave */
     int repl_infq_key_num;  /* count of infq keys need to receive from master */
     int repl_infq_cur_key_num;  /* count of infq key have received from master */
+
+    struct tm tm_cache;     /* avoid to call 'localtime' concurrent which may cause the deadlock of
+                               rdb process.
+                               update in the serverCron */
+    int ms_cache;
 };
 
 typedef struct pubsubPattern {
@@ -1284,6 +1290,7 @@ void redisLog(int level, const char *fmt, ...)
 #else
 void redisLog(int level, const char *fmt, ...);
 #endif
+void redisLogNoLock(int level, const char *fmt, ...);
 void redisLogRaw(int level, const char *msg);
 void redisLogFromHandler(int level, const char *msg);
 void usage(void);
