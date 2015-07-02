@@ -658,6 +658,10 @@ struct clusterState;
 #undef hz
 #endif
 
+/* suspend type for unlinker */
+#define REDIS_INFQ_UNLINKER_SUSPEND_NONE    0
+#define REDIS_INFQ_UNLINKER_SUSPEND_REPL    1
+#define REDIS_INFQ_UNLINKER_SUSPEND_RDB     2
 struct redisServer {
     /* General */
     pid_t pid;                  /* Main process pid. */
@@ -928,6 +932,7 @@ struct redisServer {
                                      'infq_dump_blocks_usage'*/
     int infq_unlinker_check_period; /* period(seconds) for check and continue of suspended
                                        unlinker */
+    int infq_unlinker_suspend_type; /* unlinker suspend reason. RDB, REPLICATION, NONE */
 
     /* Replication for InfQ */
     dict *infq_keys;  /* dict specify InfQ keys => DB(InfQ reside in) */
@@ -1606,6 +1611,7 @@ void qinspectCommand(redisClient *c);
 int iterateInfQ(infq_iter_callback_t cb, void *arg1, void *arg2, int err_stop);
 void* createInfQMeta();
 int iter_infq_continue_unlinker(infq_t *q, sds key, void *arg1, void *arg2);
+int iter_infq_suspend_callback(infq_t *q, sds key, void *arg1, void *arg2);
 /* Support for InfQ */
 
 #if defined(__GNUC__)

@@ -179,7 +179,6 @@ void qpopCommand(redisClient *c) {
 
     if (size == 0) {
         addReply(c, shared.nullbulk);
-        redisLog(REDIS_WARNING, "infq is empty when qpop");
         return;
     }
 
@@ -226,7 +225,6 @@ void qtopCommand(redisClient *c) {
 
     if (data_size == 0) {
         addReply(c, shared.nullbulk);
-        redisLog(REDIS_WARNING, "infq is empty when qtop");
         return;
     }
 

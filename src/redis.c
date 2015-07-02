@@ -1282,7 +1282,9 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     // Check and continue the InfQ object's background unlinker, if any, which may be stopped
     // before the rdb save for replication
     run_with_period(server.infq_unlinker_check_period * 1000) {
-        if (!server.repl_diskless_sync && dictSize(server.infq_keys) > 0) {
+        // only continue unlinker which is suspended by replication
+        if (server.infq_unlinker_suspend_type == REDIS_INFQ_UNLINKER_SUSPEND_REPL &&
+                !server.repl_diskless_sync && dictSize(server.infq_keys) > 0) {
             listNode *ln;
             listIter li;
 
@@ -1301,6 +1303,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             // No fullresync, continue the InfQ object's background unlinker
             if (ln == NULL) {
                 iterateInfQ(iter_infq_continue_unlinker, NULL, NULL, 0);
+                server.infq_unlinker_suspend_type = REDIS_INFQ_UNLINKER_SUSPEND_NONE;
             }
         }
     }
@@ -1930,6 +1933,7 @@ void initServer(void) {
     server.repl_good_slaves_count = 0;
     updateCachedTime();
 
+    server.infq_unlinker_suspend_type = REDIS_INFQ_UNLINKER_SUSPEND_NONE;
     server.infq_keys = dictCreate(&keyptrDictType, NULL);
     server.infq_metas = dictCreate(&infqMetaDictType, (void *)sizeof(infq_file_meta_t));
     server.repl_infq_file_prefix = NULL;

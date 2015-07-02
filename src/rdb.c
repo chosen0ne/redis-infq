@@ -820,6 +820,17 @@ int rdbSaveBackground(char *filename) {
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
 
+    // suspend the unlinker
+    if (server.infq_unlinker_suspend_type == REDIS_INFQ_UNLINKER_SUSPEND_NONE) {
+        if (dictSize(server.infq_metas) > 0) {
+            if (iterateInfQ(iter_infq_suspend_callback, NULL, NULL, 1) == REDIS_ERR) {
+                redisLog(REDIS_WARNING, "failed to suspend infq");
+                return REDIS_ERR;
+            }
+            server.infq_unlinker_suspend_type = REDIS_INFQ_UNLINKER_SUSPEND_RDB;
+        }
+    }
+
     start = ustime();
     if ((childpid = fork()) == 0) {
         int retval;
@@ -1362,6 +1373,15 @@ void backgroundSaveDoneHandlerDisk(int exitcode, int bysignal) {
         if (bysignal != SIGUSR1)
             server.lastbgsave_status = REDIS_ERR;
     }
+
+    // continue unlinker which is suspended by rdb
+    if (server.infq_unlinker_suspend_type == REDIS_INFQ_UNLINKER_SUSPEND_RDB) {
+        if (iterateInfQ(iter_infq_continue_unlinker, NULL, NULL, 1) == REDIS_ERR) {
+            redisLog(REDIS_WARNING, "failed to continue unlinker");
+        }
+        server.infq_unlinker_suspend_type = REDIS_INFQ_UNLINKER_SUSPEND_NONE;
+    }
+
     server.rdb_child_pid = -1;
     server.rdb_child_type = REDIS_RDB_CHILD_TYPE_NONE;
     server.rdb_save_time_last = time(NULL)-server.rdb_save_time_start;

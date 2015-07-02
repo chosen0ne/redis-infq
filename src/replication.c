@@ -476,6 +476,7 @@ int startBgsaveForReplication(void) {
                 redisLog(REDIS_WARNING, "failed to suspend infq");
                 return REDIS_ERR;
             }
+            server.infq_unlinker_suspend_type = REDIS_INFQ_UNLINKER_SUSPEND_REPL;
         }
 
         retval = rdbSaveBackground(server.rdb_filename);
