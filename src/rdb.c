@@ -777,6 +777,31 @@ werr:
     return REDIS_ERR;
 }
 
+int iter_infq_jump_callback(infq_t *q, sds key, void *arg1, void *arg2) {
+    REDIS_NOTUSED(key);
+    REDIS_NOTUSED(arg1);
+    REDIS_NOTUSED(arg2);
+
+    if (infq_push_queue_jump(q) == INFQ_ERR) {
+        redisLog(REDIS_WARNING, "failed to jump push queue");
+        return REDIS_ERR;
+    }
+
+    return REDIS_OK;
+}
+
+int iter_infq_fetch_meta_callback(infq_t *q, sds key, void *arg1, void *arg2) {
+    REDIS_NOTUSED(arg1);
+    REDIS_NOTUSED(arg2);
+
+    infq_file_meta_t    *file_meta;
+    file_meta = (infq_file_meta_t *)dictFetchValue(server.infq_metas, key);
+
+    infq_fetch_file_meta(q, file_meta);
+
+    return REDIS_OK;
+}
+
 int rdbSaveBackground(char *filename) {
     pid_t childpid;
     long long start;
@@ -785,29 +810,26 @@ int rdbSaveBackground(char *filename) {
 
     // check to see if InfQ object exists, make its push queue jump to next memory
     // block if it exists
-    if (server.infq_key != NULL) {
-        redisAssert(server.infq_db != NULL);
-
-        robj key;
-        initStaticStringObject(key, server.infq_key);
-        robj *q = lookupKeyRead(server.infq_db, &key);
-        if (q == NULL) {
-            redisLog(REDIS_WARNING, "[FATAL]failed to fetch infq by infq_key in infq_db, key: %s",
-                    server.infq_key);
+    if (dictSize(server.infq_keys) != 0) {
+        if (iterateInfQ(iter_infq_jump_callback, NULL, NULL, 1) == REDIS_ERR) {
+            redisLog(REDIS_WARNING, "failed to jump all infq");
             return REDIS_ERR;
-        } else if (q->type != REDIS_INFQ) {
-            redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
-            return REDIS_ERR;
-        } else {
-            if (infq_push_queue_jump(q->ptr) != INFQ_OK) {
-                redisLog(REDIS_WARNING, "[FATAL]failed to make a InfQ object's push queue jump to next block");
-                return REDIS_ERR;
-            }
         }
     }
 
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
+
+    // suspend the unlinker
+    if (server.infq_unlinker_suspend_type == REDIS_INFQ_UNLINKER_SUSPEND_NONE) {
+        if (dictSize(server.infq_metas) > 0) {
+            if (iterateInfQ(iter_infq_suspend_callback, NULL, NULL, 1) == REDIS_ERR) {
+                redisLog(REDIS_WARNING, "failed to suspend infq");
+                return REDIS_ERR;
+            }
+            server.infq_unlinker_suspend_type = REDIS_INFQ_UNLINKER_SUSPEND_RDB;
+        }
+    }
 
     start = ustime();
     if ((childpid = fork()) == 0) {
@@ -829,31 +851,10 @@ int rdbSaveBackground(char *filename) {
         }
 
         // pass file meta info of InfQ to parent
-        if (server.infq_file_meta != NULL && server.infq_key != NULL) {
-            redisAssert(server.infq_db != NULL);
-
-            robj key;
-            initStaticStringObject(key, server.infq_key);
-            robj *q = lookupKeyRead(server.infq_db, &key);
-            if (q == NULL) {
-                redisLog(REDIS_WARNING, "[FATAL]failed to fetch infq by infq_key in infq_db, key: %s",
-                        server.infq_key);
-                retval = REDIS_ERR;
-            } else if (q->type != REDIS_INFQ) {
-                redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
-                retval = REDIS_ERR;
-            } else {
-                infq_fetch_file_meta(q->ptr, server.infq_file_meta);
-                redisLog(REDIS_DEBUG, "[INFQ] dp: %s, f: {s: %d, e: %d, p: %s}, p: {s: %d, e: %d, p: %s}",
-                        server.infq_file_meta->data_path,
-                        server.infq_file_meta->file_blk_start,
-                        server.infq_file_meta->file_blk_end,
-                        server.infq_file_meta->file_blk_prefix,
-                        server.infq_file_meta->pop_blk_start,
-                        server.infq_file_meta->pop_blk_end,
-                        server.infq_file_meta->pop_blk_prefix);
-            }
+        if (dictSize(server.infq_metas) != 0) {
+            iterateInfQ(iter_infq_fetch_meta_callback, NULL, NULL, 0);
         }
+
         redisLog(REDIS_DEBUG, "rdb stopped...");
         exitFromChild((retval == REDIS_OK) ? 0 : 1);
     } else {
@@ -1301,9 +1302,20 @@ int rdbLoad(char *filename) {
         dbAdd(db,key,val);
 
         if (type == REDIS_RDB_TYPE_INFQ) {
-            server.infq_key = sdsdup(key->ptr);
-            server.infq_db = db;
-            redisLog(REDIS_DEBUG, "infq key: %s", server.infq_key);
+            dictEntry   *de;
+            de = dictFind(db->dict, key->ptr);
+            dictReplace(server.infq_keys, dictGetKey(de), db);
+
+            // init infq file meta
+            if (dictFetchValue(server.infq_metas, key->ptr) == NULL) {
+                void    *m;
+                if ((m = createInfQMeta()) == NULL) {
+                    redisLog(REDIS_WARNING, "failed to create infq meta");
+                    return REDIS_ERR;
+                }
+                dictReplace(server.infq_metas, dictGetKey(de), m);
+            }
+            redisLog(REDIS_DEBUG, "load infq from rdb key: %s", (char *)key->ptr);
         }
 
         /* Set the expire time if needed */
@@ -1361,6 +1373,15 @@ void backgroundSaveDoneHandlerDisk(int exitcode, int bysignal) {
         if (bysignal != SIGUSR1)
             server.lastbgsave_status = REDIS_ERR;
     }
+
+    // continue unlinker which is suspended by rdb
+    if (server.infq_unlinker_suspend_type == REDIS_INFQ_UNLINKER_SUSPEND_RDB) {
+        if (iterateInfQ(iter_infq_continue_unlinker, NULL, NULL, 1) == REDIS_ERR) {
+            redisLog(REDIS_WARNING, "failed to continue unlinker");
+        }
+        server.infq_unlinker_suspend_type = REDIS_INFQ_UNLINKER_SUSPEND_NONE;
+    }
+
     server.rdb_child_pid = -1;
     server.rdb_child_type = REDIS_RDB_CHILD_TYPE_NONE;
     server.rdb_save_time_last = time(NULL)-server.rdb_save_time_start;

@@ -296,16 +296,15 @@ struct redisCommand redisCommandTable[] = {
     {"qpoprpush",qpoprpushCommand,3,"wm",0,NULL,1,2,1,0,0},
     {"qpoplpush",qpoplpushCommand,3,"wm",0,NULL,1,2,1,0,0},
     {"lpopqpush",lpopqpushCommand,3,"wm",0,NULL,1,2,1,0,0},
-    {"rpopqpush",rpopqpushCommand,3,"wm",0,NULL,1,2,1,0,0}
+    {"rpopqpush",rpopqpushCommand,3,"wm",0,NULL,1,2,1,0,0},
+    {"qinspect",qinspectCommand,2,"rF",0,NULL,1,1,1,0,0}
 };
 
 struct evictionPoolEntry *evictionPoolAlloc(void);
 
 /*============================ Utility functions ============================ */
 
-/* Low level logging. To use only for very big messages, otherwise
- * redisLog() is to prefer. */
-void redisLogRaw(int level, const char *msg) {
+void redisLogDetail(int level, const char *msg, struct tm *tm, int ms) {
     const int syslogLevelMap[] = { LOG_DEBUG, LOG_INFO, LOG_NOTICE, LOG_WARNING };
     const char *c = ".-*#";
     FILE *fp;
@@ -323,13 +322,11 @@ void redisLogRaw(int level, const char *msg) {
         fprintf(fp,"%s",msg);
     } else {
         int off;
-        struct timeval tv;
         int role_char;
         pid_t pid = getpid();
 
-        gettimeofday(&tv,NULL);
-        off = strftime(buf,sizeof(buf),"%d %b %H:%M:%S.",localtime(&tv.tv_sec));
-        snprintf(buf+off,sizeof(buf)-off,"%03d",(int)tv.tv_usec/1000);
+        off = strftime(buf,sizeof(buf),"%d %b %H:%M:%S.",tm);
+        snprintf(buf+off,sizeof(buf)-off,"%03d",ms);
         if (server.sentinel_mode) {
             role_char = 'X'; /* Sentinel. */
         } else if (pid != server.pid) {
@@ -346,6 +343,15 @@ void redisLogRaw(int level, const char *msg) {
     if (server.syslog_enabled) syslog(syslogLevelMap[level], "%s", msg);
 }
 
+/* Low level logging. To use only for very big messages, otherwise
+ * redisLog() is to prefer. */
+void redisLogRaw(int level, const char *msg) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+
+    redisLogDetail(level, msg, localtime(&tv.tv_sec), (int)tv.tv_usec/1000);
+}
+
 /* Like redisLogRaw() but with printf-alike support. This is the function that
  * is used across the code. The raw version is only used in order to dump
  * the INFO output on crash. */
@@ -360,6 +366,19 @@ void redisLog(int level, const char *fmt, ...) {
     va_end(ap);
 
     redisLogRaw(level,msg);
+}
+
+void redisLogNoLock(int level, const char *fmt, ...) {
+    va_list ap;
+    char msg[REDIS_MAX_LOGMSG_LEN];
+
+    if ((level&0xff) < server.verbosity) return;
+
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    redisLogDetail(level, msg, &server.tm_cache, server.ms_cache);
 }
 
 /* Log a fixed message without printf-alike capabilities, in a way that is
@@ -398,6 +417,7 @@ long long ustime(void) {
     gettimeofday(&tv, NULL);
     ust = ((long long)tv.tv_sec)*1000000;
     ust += tv.tv_usec;
+    server.ms_cache = (int)tv.tv_usec / 1000;
     return ust;
 }
 
@@ -471,6 +491,15 @@ void dictSdsDestructor(void *privdata, void *val)
     DICT_NOTUSED(privdata);
 
     sdsfree(val);
+}
+
+void dictInfqMetaDestructor(void *privdata, void *val)
+{
+    size_t  s = (size_t)privdata;
+
+    if (munmap(val, s) == -1) {
+        redisLog(REDIS_WARNING, "failed to munmap, err: %s", strerror(errno));
+    }
 }
 
 int dictObjKeyCompare(void *privdata, const void *key1,
@@ -659,6 +688,15 @@ dictType replScriptCacheDictType = {
     dictSdsKeyCaseCompare,      /* key compare */
     dictSdsDestructor,          /* key destructor */
     NULL                        /* val destructor */
+};
+
+dictType infqMetaDictType = {
+    dictSdsHash,                /* hash function */
+    NULL,                       /* key dup */
+    NULL,                       /* val dup */
+    dictSdsKeyCompare,          /* key compare */
+    NULL,                       /* key destructor */
+    dictInfqMetaDestructor      /* val destructor */
 };
 
 int htNeedsResize(dict *dict) {
@@ -1056,6 +1094,21 @@ void databasesCron(void) {
 void updateCachedTime(void) {
     server.unixtime = time(NULL);
     server.mstime = mstime();
+
+    localtime_r(&server.unixtime, &server.tm_cache);
+}
+
+int iter_infq_continue_unlinker(infq_t *q, sds key, void *arg1, void *arg2) {
+    REDIS_NOTUSED(key);
+    REDIS_NOTUSED(arg1);
+    REDIS_NOTUSED(arg2);
+
+    if (infq_continue_bg_exec_if_suspended(q, INFQ_UNLINK_BG_EXEC) == INFQ_ERR) {
+        redisLog(REDIS_WARNING, "failed to continue unlinker");
+        return REDIS_ERR;
+    }
+
+    return REDIS_OK;
 }
 
 /* This is our timer interrupt, called server.hz times per second.
@@ -1076,7 +1129,6 @@ void updateCachedTime(void) {
  * so in order to throttle execution of things we want to do less frequently
  * a macro is used: run_with_period(milliseconds) { .... }
  */
-
 int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     int j;
     REDIS_NOTUSED(eventLoop);
@@ -1230,7 +1282,9 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     // Check and continue the InfQ object's background unlinker, if any, which may be stopped
     // before the rdb save for replication
     run_with_period(server.infq_unlinker_check_period * 1000) {
-        if (!server.repl_diskless_sync && server.infq_key != NULL) {
+        // only continue unlinker which is suspended by replication
+        if (server.infq_unlinker_suspend_type == REDIS_INFQ_UNLINKER_SUSPEND_REPL &&
+                !server.repl_diskless_sync && dictSize(server.infq_keys) > 0) {
             listNode *ln;
             listIter li;
 
@@ -1248,21 +1302,8 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             }
             // No fullresync, continue the InfQ object's background unlinker
             if (ln == NULL) {
-                redisAssert(server.infq_db != NULL);
-
-                robj key;
-                initStaticStringObject(key, server.infq_key);
-                robj *q = lookupKeyRead(server.infq_db, &key);
-                if (q == NULL) {
-                    redisLog(REDIS_WARNING, "[FATAL]failed to fetch infq by infq_key in infq_db, key: %s",
-                            server.infq_key);
-                } else if (q->type != REDIS_INFQ) {
-                    redisLog(REDIS_WARNING, "[FATAL]not a InfQ object");
-                } else {
-                    if (infq_continue_bg_exec_if_suspended(q->ptr, INFQ_UNLINK_BG_EXEC) != INFQ_OK) {
-                        redisLog(REDIS_WARNING, "[FATAL]failed to continue a InfQ object's background unlinker");
-                    }
-                }
+                iterateInfQ(iter_infq_continue_unlinker, NULL, NULL, 0);
+                server.infq_unlinker_suspend_type = REDIS_INFQ_UNLINKER_SUSPEND_NONE;
             }
         }
     }
@@ -1607,7 +1648,6 @@ void initServerConfig(void) {
     server.infq_pushq_blocks_num = 20;
     server.infq_mem_block_size = 32 * 1024 * 1024;
     server.infq_dump_blocks_usage = 0.5;
-    server.infq_file_meta = NULL;
     server.infq_unlinker_check_period = 5;
 }
 
@@ -1893,25 +1933,18 @@ void initServer(void) {
     server.repl_good_slaves_count = 0;
     updateCachedTime();
 
-    server.infq_key = NULL;
-    server.infq_file_meta = (infq_file_meta_t *)mmap(
-            NULL,
-            sizeof(infq_file_meta_t),
-            PROT_READ | PROT_WRITE,
-            MAP_ANON | MAP_SHARED,
-            -1,
-            0);
-    if (server.infq_file_meta == MAP_FAILED) {
-        redisLog(REDIS_WARNING, "failed to create shared memory, err: %s", strerror(errno));
-        exit(1);
-    }
-    server.repl_infq_files = NULL;
+    server.infq_unlinker_suspend_type = REDIS_INFQ_UNLINKER_SUSPEND_NONE;
+    server.infq_keys = dictCreate(&keyptrDictType, NULL);
+    server.infq_metas = dictCreate(&infqMetaDictType, (void *)sizeof(infq_file_meta_t));
     server.repl_infq_file_prefix = NULL;
     server.repl_infq_dir = NULL;
     server.repl_infq_temp_dir = NULL;
     server.repl_infq_data_path = NULL;
     server.repl_infq_file_num = -1;
     server.repl_infq_file_cur_num = -1;
+    server.repl_infq_keys = NULL;
+    server.repl_infq_key_num = -1;
+    server.repl_infq_cur_key_num = -1;
 
     /* Create the serverCron() time event, that's our main way to process
      * background operations. */
@@ -3114,51 +3147,43 @@ sds genRedisInfoString(char *section) {
     if (allsections || defsections || !strcasecmp(section, "InfQ")) {
         if (sections++) info = sdscat(info, "\r\n");
 
-        infq_t  *q;
-        if (server.infq_key == NULL) {
-            q = NULL;
-        } else {
-            robj key;
-            initStaticStringObject(key, server.infq_key);
-            robj *qobj = lookupKeyRead(server.infq_db, &key);
-            if (qobj == NULL || qobj->ptr == NULL) {
-                q = NULL;
-            } else {
-                q = qobj->ptr;
-            }
-        }
+        // show all InfQ keys and info
+        dictIterator    *di;
+        dictEntry       *de;
 
-        if (q == NULL) {
-            info = sdscatprintf(info,
-                    "# InfQ\r\n"
-                    "empty\r\n");
+        if (dictSize(server.infq_keys) == 0) {
+            info = sdscatprintf(info, "# InfQ\r\nempty\r\n");
         } else {
-            infq_stats_t    stats;
-            if (infq_fetch_stats(q, &stats) == INFQ_ERR) {
-                info = sdscatprintf(info,
-                        "#InfQ\r\n"
-                        "failed to fetch stats\r\n");
-            } else {
-                info = sdscatprintf(info,
-                        "# InfQ\r\n"
-                        "infQ_key:%s\r\n"
-                        "mem_size:%d\r\n"
-                        "file_size:%d\r\n"
-                        "mem_block_size:%d\r\n"
-                        "pushq_blocks_num:%d\r\n"
-                        "pushq_used_blocks:%d\r\n"
-                        "popq_blocks_num:%d\r\n"
-                        "popq_used_blocks:%d\r\n"
-                        "fileq_blocks_num:%d\r\n",
-                        server.infq_key,
-                        stats.mem_size,
-                        stats.file_size,
-                        stats.mem_block_size,
-                        stats.pushq_blocks_num,
+            info = sdscatprintf(info, "# InfQ\r\nmem_block_size:%d, pushq_blocks_num:%d, "
+                    "popq_blocks_num:%d\r\n",
+                    server.infq_mem_block_size,
+                    server.infq_pushq_blocks_num,
+                    server.infq_popq_blocks_num);
+            di = dictGetIterator(server.infq_keys);
+            while ((de = dictNext(di)) != NULL) {
+                robj            key, *qobj;
+                infq_stats_t    stats;
+
+                initStaticStringObject(key, dictGetKey(de));
+                qobj = lookupKeyRead(dictGetVal(de), &key);
+                if (qobj == NULL || qobj->ptr == NULL) {
+                    redisLog(REDIS_WARNING, "failed to fetch InfQ in infoCommand, key: %s",
+                            (char *)key.ptr);
+                    continue;
+                }
+
+                if (infq_fetch_stats(qobj->ptr, &stats) == INFQ_ERR) {
+                    info = sdscatprintf(info, "%s: Failed to fetch stats\r\n", (char *)key.ptr);
+                    continue;
+                }
+
+                info = sdscatprintf(info, "%s=[publks:%d, poblks:%d, fblks:%d, ms:%d, fs:%d]\r\n",
+                        (char *)key.ptr,
                         stats.pushq_used_blocks,
-                        stats.popq_blocks_num,
                         stats.popq_used_blocks,
-                        stats.fileq_blocks_num);
+                        stats.fileq_blocks_num,
+                        stats.mem_size,
+                        stats.file_size);
             }
         }
     }
@@ -3698,6 +3723,31 @@ void redisSetProcTitle(char *title) {
 #else
     REDIS_NOTUSED(title);
 #endif
+}
+
+int iterateInfQ(infq_iter_callback_t cb, void *arg1, void *arg2, int err_stop) {
+    dictIterator    *di;
+    dictEntry       *de;
+
+    if (dictSize(server.infq_keys) == 0) return REDIS_OK;
+
+    di = dictGetIterator(server.infq_keys);
+    while ((de = dictNext(di)) != NULL) {
+        robj    key, *qobj;
+
+        initStaticStringObject(key, dictGetKey(de));
+        qobj = lookupKeyRead(dictGetVal(de), &key);
+        redisAssert(qobj != NULL && qobj->type == REDIS_INFQ);
+
+        if (cb(qobj->ptr, key.ptr, arg1, arg2) == REDIS_ERR) {
+            redisLog(REDIS_WARNING, "failed to callback on InfQ, key: %s", (char *)key.ptr);
+            if (err_stop) {
+                return REDIS_ERR;
+            }
+        }
+    }
+
+    return REDIS_OK;
 }
 
 int main(int argc, char **argv) {

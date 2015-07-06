@@ -247,6 +247,7 @@ robj *createInfqObject(robj *key) {
     char            buf[1024];
     int             ret, len;
     sds             s;
+    char            *name;
 
     // make sure directory existence
     if (access(server.infq_data_path, F_OK) == -1) {
@@ -287,7 +288,13 @@ robj *createInfqObject(robj *key) {
     conf.popq_blocks_num = server.infq_popq_blocks_num;
     conf.data_path = buf;
     conf.block_usage_to_dump = server.infq_dump_blocks_usage;
-    infq_t* q = infq_init_by_conf(&conf);
+
+    if (key == NULL) {
+        name = "__NULL__";
+    } else {
+        name = (sds)key->ptr;
+    }
+    infq_t* q = infq_init_by_conf(&conf, name);
     if (q == NULL) {
         redisLog(REDIS_NOTICE, "failed to init infQ, data_path: %s", buf);
         return NULL;
@@ -751,6 +758,7 @@ char *strEncoding(int encoding) {
     case REDIS_ENCODING_INTSET: return "intset";
     case REDIS_ENCODING_SKIPLIST: return "skiplist";
     case REDIS_ENCODING_EMBSTR: return "embstr";
+    case REDIS_ENCODING_INFQ: return "infq";
     default: return "unknown";
     }
 }
@@ -807,15 +815,15 @@ void objectCommand(redisClient *c) {
 
 void infq_debug_log(const char *msg)
 {
-    redisLog(REDIS_DEBUG, "[INFQ_DEBUG]: %s", msg);
+    redisLogNoLock(REDIS_DEBUG, "[INFQ_DEBUG]: %s", msg);
 }
 
 void infq_info_log(const char *msg)
 {
-    redisLog(REDIS_NOTICE, "[INFQ_INFO]: %s", msg);
+    redisLogNoLock(REDIS_NOTICE, "[INFQ_INFO]: %s", msg);
 }
 
 void infq_error_log(const char *msg)
 {
-    redisLog(REDIS_WARNING, "[INFQ_ERR]: %s", msg);
+    redisLogNoLock(REDIS_WARNING, "[INFQ_ERR]: %s", msg);
 }

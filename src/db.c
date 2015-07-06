@@ -97,7 +97,7 @@ void dbAdd(redisDb *db, robj *key, robj *val) {
     redisAssertWithInfo(NULL,key,retval == REDIS_OK);
     if (val->type == REDIS_LIST) signalListAsReady(db, key);
     if (server.cluster_enabled) slotToKeyAdd(key);
- }
+}
 
 /* Overwrite an existing key with a new value. Incrementing the reference
  * count of the new value is up to the caller.
@@ -163,6 +163,9 @@ int dbDelete(redisDb *db, robj *key) {
     /* Deleting an entry from the expires dict will not free the sds of
      * the key, because it is shared with the main dictionary. */
     if (dictSize(db->expires) > 0) dictDelete(db->expires,key->ptr);
+    /* 同expires一样, 与db共享key的sds, value是DB的指针, 同样不需要释放 */
+    if (dictSize(server.infq_keys) > 0) dictDelete(server.infq_keys, key->ptr);
+    if (dictSize(server.infq_metas) > 0) dictDelete(server.infq_metas, key->ptr);
     if (dictDelete(db->dict,key->ptr) == DICT_OK) {
         if (server.cluster_enabled) slotToKeyDel(key);
         return 1;
@@ -218,6 +221,13 @@ long long emptyDb(void(callback)(void*)) {
         dictEmpty(server.db[j].dict,callback);
         dictEmpty(server.db[j].expires,callback);
     }
+
+    // clear old status of InfQ
+    if (server.infq_keys != NULL || server.infq_metas != NULL) {
+        dictEmpty(server.infq_keys, callback);
+        dictEmpty(server.infq_metas, callback);
+    }
+
     if (server.cluster_enabled) slotToKeyFlush();
     return removed;
 }
@@ -282,13 +292,6 @@ void delCommand(redisClient *c) {
 
     for (j = 1; j < c->argc; j++) {
         expireIfNeeded(c->db,c->argv[j]);
-
-        // make sure to reset attrs for InfQ
-        if (server.infq_key != NULL && sdscmp(c->argv[j]->ptr, server.infq_key) == 0) {
-            sdsfree(server.infq_key);
-            server.infq_key = NULL;
-            server.infq_db = NULL;
-        }
 
         if (dbDelete(c->db,c->argv[j])) {
             signalModifiedKey(c->db,c->argv[j]);
