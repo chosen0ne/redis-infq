@@ -197,7 +197,7 @@ void SHA1Final(unsigned char digest[20], SHA1_CTX* context)
 }
 /* ================ end of sha1.c ================ */
 
-#if 1
+#if 0
 #define BUFSIZE 4096
 
 int
