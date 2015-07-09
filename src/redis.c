@@ -297,6 +297,8 @@ struct redisCommand redisCommandTable[] = {
     {"qpoplpush",qpoplpushCommand,3,"wm",0,NULL,1,2,1,0,0},
     {"lpopqpush",lpopqpushCommand,3,"wm",0,NULL,1,2,1,0,0},
     {"rpopqpush",rpopqpushCommand,3,"wm",0,NULL,1,2,1,0,0},
+    {"qrpoplpush",qrpoplpushCommand,3,"wm",0,NULL,1,2,1,0,0},
+    {"qpushx",qpushxCommand,3,"wmF",0,NULL,1,1,1,0,0},
     {"qinspect",qinspectCommand,2,"rF",0,NULL,1,1,1,0,0}
 };
 

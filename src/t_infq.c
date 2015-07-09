@@ -10,6 +10,8 @@
 
 #include <sys/mman.h>
 
+#define INFQ_AT_MAX_BUF_SIZE    100 * 1024
+
 unsigned long infqLength(robj *q) {
     if (q->encoding == REDIS_ENCODING_INFQ) {
         return infq_size(q->ptr);
@@ -120,6 +122,15 @@ robj* deserialize(const void *dataptr, int size) {
 
 /*-----------------------------------------------------------------------------
  * infQ Commands
+ *
+ * Aims on replcaing most commands of Lists.
+ * qpush => lpush
+ * qpop  => rpop
+ * qlen  => llen
+ * qat   => lindex
+ * qrange => lranage
+ * qpushx => lpushx
+ * qrpoplpush => rpoplpush
  *----------------------------------------------------------------------------*/
 
 void qpushCommand(redisClient *c) {
@@ -158,6 +169,25 @@ void qpushCommand(redisClient *c) {
     }
     addReplyLongLong(c, qobj ? infqLength(qobj) : 0);
     server.dirty += pushed;
+}
+
+void qpushxCommand(redisClient *c) {
+    robj    *qobj;
+
+    if ((qobj = lookupKeyReadOrReply(c, c->argv[1], shared.czero)) == NULL ||
+            checkType(c, qobj, REDIS_INFQ)) {
+        return;
+    }
+
+    c->argv[2] = tryObjectEncoding(c->argv[2]);
+    if (pushObj(qobj, c->argv[2]) == REDIS_ERR) {
+        redisLog(REDIS_WARNING, "failed to push InfQ, key: %s", (sds)c->argv[1]->ptr);
+        addReplyErrorFormat(c, "failed to push infq");
+        return;
+    }
+
+    addReplyLongLong(c, infqLength(qobj));
+    server.dirty += 1;
 }
 
 void qpopCommand(redisClient *c) {
@@ -272,7 +302,7 @@ void qdelCommand(redisClient *c) {
 }
 
 void qatCommand(redisClient *c) {
-    const void  *data;
+    char*       data[INFQ_AT_MAX_BUF_SIZE];
     int         data_size;
     robj        *q, *obj;
     long        idx, qlen;
@@ -298,7 +328,7 @@ void qatCommand(redisClient *c) {
         return;
     }
 
-    if (infq_at_zero_cp(q->ptr, idx, &data, &data_size) == INFQ_ERR) {
+    if (infq_at(q->ptr, idx, &data, INFQ_AT_MAX_BUF_SIZE, &data_size) == INFQ_ERR) {
         addReplyError(c, "failed to call at");
         sds key = c->argv[1]->ptr;
         redisLog(REDIS_WARNING, "failed to call at of InfQ, key: %s, size: %ld, idx: %ld",
@@ -365,7 +395,7 @@ void qrangeCommand(redisClient *c) {
             sds key = c->argv[1]->ptr;
             redisLog(REDIS_WARNING, "failed to fetch range of InfQ, key: %s, "
                     "range: [%ld, %ld], idx: %d", key, start, end, i);
-            return;
+            continue;
         }
 
         if (data_size == 0) {
@@ -494,8 +524,8 @@ void lpopQpushGeneric(redisClient *c, int where) {
     incrRefCount(touchedkey);
 
     if (pushObj(qobj, value) == REDIS_ERR) {
-         redisLog(REDIS_WARNING, "failed to pop list and push InfQ, key: %s, value: %s, where: %d",
-                 (sds)c->argv[2]->ptr, (sds)value->ptr, where);
+         redisLog(REDIS_WARNING, "failed to pop list and push InfQ, key: %s, where: %d",
+                 (sds)c->argv[2]->ptr, where);
          addReplyErrorFormat(c, "failed to push infq");
 
          // push value back to list
@@ -524,6 +554,73 @@ void rpopqpushCommand(redisClient *c) {
 
 void lpopqpushCommand(redisClient *c) {
     lpopQpushGeneric(c, REDIS_HEAD);
+}
+
+void qrpoplpushCommand(redisClient *c) {
+    robj        *sobj, *dobj, *obj;
+    dictEntry   *de;
+    const void  *dataptr;
+    int         size;
+
+    if ((sobj = lookupKeyReadOrReply(c, c->argv[1], shared.nullbulk)) == NULL ||
+            checkType(c, sobj, REDIS_INFQ)) {
+        return;
+    }
+
+    // source queue is empty
+    if (infq_size(sobj->ptr) == 0) {
+        addReply(c, shared.nullbulk);
+        return;
+    }
+
+    dobj = lookupKeyWrite(c->db, c->argv[2]);
+    if (dobj && checkType(c, dobj, REDIS_INFQ)) {
+        return;
+    }
+
+    // create infq if needed
+    if (dobj == NULL) {
+        de = dictFind(server.infq_keys, c->argv[2]->ptr);
+        redisAssert(de == NULL);
+
+        dobj = createInfQ(c->argv[2], c->db);
+        if (dobj == NULL) {
+            redisLog(REDIS_WARNING, "failed to create InfQ");
+            addReplyError(c, "failed to create InfQ");
+            return;
+        }
+    }
+
+    if (infq_top_zero_cp(sobj->ptr, &dataptr, &size) == INFQ_ERR) {
+        redisLog(REDIS_WARNING, "failed to fetch top from infq, key: %s", (sds)c->argv[1]->ptr);
+        addReplyError(c, "failed to fetch pop from infq");
+        return;
+    }
+
+    if (size == 0) {
+        addReply(c, shared.nullbulk);
+        return;
+    }
+
+    if ((obj = deserialize(dataptr, size)) == NULL) {
+        addReplyError(c, "failed to deserial");
+        return;
+    }
+
+    if (infq_push(dobj->ptr, (void *)dataptr, size) == INFQ_ERR) {
+        redisLog(REDIS_WARNING, "failed to push infq, key: %s", (sds)c->argv[1]->ptr);
+        addReplyError(c, "failed to push infq");
+        return;
+    }
+
+    if (infq_just_pop(sobj->ptr) == INFQ_ERR) {
+        redisLog(REDIS_WARNING, "failed to just pop from infq, key: %s", (sds)c->argv[1]->ptr);
+        addReplyError(c, "failed to just pop");
+        return;
+    }
+
+    addReplyBulk(c, obj);
+    server.dirty++;
 }
 
 void qinspectCommand(redisClient *c) {

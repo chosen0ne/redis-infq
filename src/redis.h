@@ -1606,6 +1606,8 @@ void qpoplpushCommand(redisClient *c);
 void rpopqpushCommand(redisClient *c);
 void lpopqpushCommand(redisClient *c);
 void qinspectCommand(redisClient *c);
+void qrpoplpushCommand(redisClient *c);
+void qpushxCommand(redisClient *c);
 
 /* err_stop: 指定是否遇到某个infq回调失败，就返回错误 */
 int iterateInfQ(infq_iter_callback_t cb, void *arg1, void *arg2, int err_stop);
