@@ -790,18 +790,6 @@ int iter_infq_jump_callback(infq_t *q, sds key, void *arg1, void *arg2) {
     return REDIS_OK;
 }
 
-int iter_infq_fetch_meta_callback(infq_t *q, sds key, void *arg1, void *arg2) {
-    REDIS_NOTUSED(arg1);
-    REDIS_NOTUSED(arg2);
-
-    infq_file_meta_t    *file_meta;
-    file_meta = (infq_file_meta_t *)dictFetchValue(server.infq_metas, key);
-
-    infq_fetch_file_meta(q, file_meta);
-
-    return REDIS_OK;
-}
-
 int rdbSaveBackground(char *filename) {
     pid_t childpid;
     long long start;
@@ -822,7 +810,7 @@ int rdbSaveBackground(char *filename) {
 
     // suspend the unlinker
     if (server.infq_unlinker_suspend_type == REDIS_INFQ_UNLINKER_SUSPEND_NONE) {
-        if (dictSize(server.infq_metas) > 0) {
+        if (dictSize(server.infq_keys) > 0) {
             if (iterateInfQ(iter_infq_suspend_callback, NULL, NULL, 1) == REDIS_ERR) {
                 redisLog(REDIS_WARNING, "failed to suspend infq");
                 return REDIS_ERR;
@@ -848,11 +836,6 @@ int rdbSaveBackground(char *filename) {
                     "RDB: %zu MB of memory used by copy-on-write",
                     private_dirty/(1024*1024));
             }
-        }
-
-        // pass file meta info of InfQ to parent
-        if (dictSize(server.infq_metas) != 0) {
-            iterateInfQ(iter_infq_fetch_meta_callback, NULL, NULL, 0);
         }
 
         redisLog(REDIS_DEBUG, "rdb stopped...");
@@ -1305,17 +1288,7 @@ int rdbLoad(char *filename) {
             dictEntry   *de;
             de = dictFind(db->dict, key->ptr);
             dictReplace(server.infq_keys, dictGetKey(de), db);
-
-            // init infq file meta
-            if (dictFetchValue(server.infq_metas, key->ptr) == NULL) {
-                void    *m;
-                if ((m = createInfQMeta()) == NULL) {
-                    redisLog(REDIS_WARNING, "failed to create infq meta");
-                    return REDIS_ERR;
-                }
-                dictReplace(server.infq_metas, dictGetKey(de), m);
-            }
-            redisLog(REDIS_DEBUG, "load infq from rdb key: %s", (char *)key->ptr);
+            redisLog(REDIS_NOTICE, "load infq from rdb, key: %s", (char *)key->ptr);
         }
 
         /* Set the expire time if needed */
@@ -1345,6 +1318,19 @@ eoferr: /* unexpected end of file is handled here with a fatal exit */
     redisLog(REDIS_WARNING,"Short read or OOM loading DB. Unrecoverable error, aborting now.");
     exit(1);
     return REDIS_ERR; /* Just to avoid warning */
+}
+
+int iter_infq_done_dump_callback(infq_t *q, sds key, void *arg1, void *arg2) {
+    REDIS_NOTUSED(arg1);
+    REDIS_NOTUSED(arg2);
+
+    // switch dump meta
+    if (infq_done_dump(q) == INFQ_ERR) {
+        redisLog(REDIS_WARNING, "failed to finish dumping, infq name: %s", key);
+        return REDIS_ERR;
+    }
+
+    return REDIS_OK;
 }
 
 /* A background saving child (BGSAVE) terminated its work. Handle this.
@@ -1380,6 +1366,12 @@ void backgroundSaveDoneHandlerDisk(int exitcode, int bysignal) {
             redisLog(REDIS_WARNING, "failed to continue unlinker");
         }
         server.infq_unlinker_suspend_type = REDIS_INFQ_UNLINKER_SUSPEND_NONE;
+    }
+
+    // Child process finished dumping RDB, and Parent process need to
+    // make meta data index point to the right one.
+    if (iterateInfQ(iter_infq_done_dump_callback, NULL, NULL, 1) == REDIS_ERR) {
+        redisLog(REDIS_WARNING, "failed to finish dump for all the InfQ");
     }
 
     server.rdb_child_pid = -1;
@@ -1646,6 +1638,11 @@ void saveCommand(redisClient *c) {
     }
     if (rdbSave(server.rdb_filename) == REDIS_OK) {
         addReply(c,shared.ok);
+
+        // Need to switch to the new meta data after rdb dumped
+        if (iterateInfQ(iter_infq_done_dump_callback, NULL, NULL, 1) == REDIS_ERR) {
+            redisLog(REDIS_WARNING, "failed to finish dump for all the InfQ");
+        }
     } else {
         addReply(c,shared.err);
     }

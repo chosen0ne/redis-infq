@@ -165,7 +165,6 @@ int dbDelete(redisDb *db, robj *key) {
     if (dictSize(db->expires) > 0) dictDelete(db->expires,key->ptr);
     /* 同expires一样, 与db共享key的sds, value是DB的指针, 同样不需要释放 */
     if (dictSize(server.infq_keys) > 0) dictDelete(server.infq_keys, key->ptr);
-    if (dictSize(server.infq_metas) > 0) dictDelete(server.infq_metas, key->ptr);
     if (dictDelete(db->dict,key->ptr) == DICT_OK) {
         if (server.cluster_enabled) slotToKeyDel(key);
         return 1;
@@ -223,9 +222,8 @@ long long emptyDb(void(callback)(void*)) {
     }
 
     // clear old status of InfQ
-    if (server.infq_keys != NULL || server.infq_metas != NULL) {
+    if (server.infq_keys != NULL ) {
         dictEmpty(server.infq_keys, callback);
-        dictEmpty(server.infq_metas, callback);
     }
 
     if (server.cluster_enabled) slotToKeyFlush();

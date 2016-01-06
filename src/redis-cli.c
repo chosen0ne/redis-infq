@@ -653,7 +653,8 @@ static int cliSendCommand(int argc, char **argv, int repeat) {
         (argc == 3 && !strcasecmp(command,"latency") &&
                        !strcasecmp(argv[1],"graph")) ||
         (argc == 2 && !strcasecmp(command,"latency") &&
-                       !strcasecmp(argv[1],"doctor")))
+                       !strcasecmp(argv[1],"doctor")) ||
+        (argc == 2 && !strcasecmp(command, "qinspect")))
     {
         output_raw = 1;
     }

@@ -471,7 +471,7 @@ int startBgsaveForReplication(void) {
     } else {
         // check to see if InfQ object exists, suspend its background
         // unlinker if it exists
-        if (dictSize(server.infq_metas) > 0) {
+        if (dictSize(server.infq_keys) > 0) {
             if (iterateInfQ(iter_infq_suspend_callback, NULL, NULL, 1) == REDIS_ERR) {
                 redisLog(REDIS_WARNING, "failed to suspend infq");
                 return REDIS_ERR;
@@ -711,15 +711,15 @@ void putSlaveOnline(redisClient *slave) {
 int openAndFillState(redisClient *slave) {
     struct redis_stat buf;
     sds path = sdsempty();
-    infq_file_meta_t *fmeta;
+    infq_dump_meta_t *dmeta;
 
-    fmeta = (infq_file_meta_t *)dictFetchValue(server.infq_metas, slave->repl_infq_cur_key);
-    // 'fmeta == NULL' never happens in normal case
-    redisAssert(fmeta != NULL);
+    dmeta = fetch_infq_dump_meta(slave->repl_infq_cur_key);
+    // 'dmeta == NULL' never happens in normal case
+    redisAssert(dmeta != NULL);
 
     // TODO: support relative path
     path = sdscatprintf(path, "%s/%s_%d",
-            fmeta->data_path,
+            dmeta->file_path,
             slave->repl_infq_file_prefix,
             slave->repl_infq_file_suffix);
     // NOTICE: each slave may open the file.
@@ -765,21 +765,30 @@ void doneSendOneInfQ(redisClient *slave) {
     slave->repl_infq_cur_key = NULL;
 }
 
-void prepareSendInfQFiles(redisClient *slave, infq_file_meta_t *fmeta) {
+void prepareSendInfQFiles(redisClient *slave, infq_dump_meta_t *dmeta) {
     slave->repl_infq_files = listCreate();
     listSetFreeMethod(slave->repl_infq_files, infq_files_free);
 
+    redisLog(REDIS_NOTICE, "prepare send infq key: %s, file blocks: [%d, %d), pop blocks: [%d, %d)",
+            slave->repl_infq_cur_key,
+            dmeta->file_meta.file_range.start,
+            dmeta->file_meta.file_range.end,
+            dmeta->popq_meta.file_range.start,
+            dmeta->popq_meta.file_range.end);
+
     // file blocks
-    for (int i = fmeta->file_blk_start; i < fmeta->file_blk_end; i++) {
+    for (int i = dmeta->file_meta.file_range.start;
+            i < dmeta->file_meta.file_range.end; i++) {
         struct infqFileInfo *f = zmalloc(sizeof(struct infqFileInfo));
-        f->prefix = fmeta->file_blk_prefix;
+        f->prefix = INFQ_FILE_BLOCK_PREFIX;
         f->suffix = i;
         listAddNodeTail(slave->repl_infq_files, f);
     }
     // pop blocks
-    for (int i = fmeta->pop_blk_start; i < fmeta->pop_blk_end; i++) {
+    for (int i = dmeta->popq_meta.file_range.start;
+            i < dmeta->popq_meta.file_range.end; i++) {
         struct infqFileInfo *f = zmalloc(sizeof(struct infqFileInfo));
-        f->prefix = fmeta->pop_blk_prefix;
+        f->prefix = INFQ_POP_BLOCK_PREFIX;
         f->suffix = i;
         listAddNodeTail(slave->repl_infq_files, f);
     }
@@ -831,7 +840,7 @@ void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
     // Header: InfQ key + Data Path + File Num
     if (slave->repl_infq_cur_key == NULL) {
         listNode            *node;
-        infq_file_meta_t    *fmeta;
+        infq_dump_meta_t    *dmeta;
         int                 file_num;
 
         node = listNext(slave->repl_infq_keys_iter);
@@ -843,12 +852,12 @@ void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
         slave->repl_infq_cur_key = node->value;
 
         // prepare all files belong the infq to send to slave
-        fmeta = (infq_file_meta_t *)dictFetchValue(server.infq_metas, slave->repl_infq_cur_key);
+        dmeta = fetch_infq_dump_meta(slave->repl_infq_cur_key);
         // 'fmeta == NULL' never happend in normal case
-        redisAssert(fmeta != NULL);
+        redisAssert(dmeta != NULL);
 
-        file_num = fmeta->file_blk_end - fmeta->file_blk_start +
-                fmeta->pop_blk_end - fmeta->pop_blk_start;
+        file_num = dmeta->file_meta.file_range.end - dmeta->file_meta.file_range.start
+                + dmeta->popq_meta.file_range.end - dmeta->popq_meta.file_range.start;
         redisLog(REDIS_DEBUG, "start to send InfQ, key: %s, file num: %d",
                 slave->repl_infq_cur_key,
                 file_num);
@@ -862,9 +871,9 @@ void sendInfQFilesToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
 
         slave->replpreamble = sdscatprintf(sdsempty(), "$%s %s %d\r\n",
                 slave->repl_infq_cur_key,
-                fmeta->data_path,
+                dmeta->file_path,
                 file_num);
-        prepareSendInfQFiles(slave, fmeta);
+        prepareSendInfQFiles(slave, dmeta);
 
         return;
     }
@@ -1320,6 +1329,7 @@ int readInfQHeader(int fd) {
     }
 
     server.repl_infq_file_num = strtol(argv[2], NULL, 10);
+    // expected: $# # 0\r\n
     if (server.repl_infq_file_num == 0) {
         return REDIS_OK;
     }
@@ -1458,34 +1468,64 @@ int removeDir(char *dir) {
     return failed ? REDIS_ERR : REDIS_OK;
 }
 
+int renameInfQFiles() {
+    dictIterator    *di;
+    dictEntry       *de;
+    sds             dist_dir;
+    robj            *temp_dirobj;
+    long long       t1, t2, t3;
+
+    if (dictSize(server.repl_infq_temp_dirs) == 0) return REDIS_OK;
+
+    // Remove and rename infq directories
+    di = dictGetIterator(server.repl_infq_temp_dirs);
+    while ((de = dictNext(di)) != NULL) {
+        dist_dir = (sds)dictGetKey(de);
+        temp_dirobj = (robj *)dictGetVal(de);
+
+        t1 = ustime();
+        if (access(dist_dir, F_OK) == 0) {
+            t2 = ustime();
+            // clear old infq dir
+            if (removeDir(dist_dir) == REDIS_ERR) {
+                redisLog(REDIS_WARNING, "Failed to remove old infq dir, dir: %s", dist_dir);
+                return REDIS_ERR;
+            }
+            t3 = ustime();
+            redisLog(REDIS_NOTICE, "Remove old infq dir, dir: %s", dist_dir);
+        }
+
+        if (temp_dirobj != NULL) {
+            if (rename((sds)(temp_dirobj->ptr), dist_dir) == -1) {
+                redisLog(REDIS_WARNING,"Failed to rename InfQ dir in MASTER <-> SLAVE synchronization: %s, "
+                        "old: %s, new: %s",
+                        strerror(errno),
+                        dist_dir,
+                        (sds)temp_dirobj->ptr);
+                replicationAbortRecvInfQ();
+                return REDIS_ERR;
+            }
+        }
+
+        redisLog(REDIS_DEBUG, "finish to rename temporary dir of a InfQ, key: %s, access: %lld, "
+                "remove dir: %lld, rename: %lld",
+                dist_dir,
+                t2 - t1,
+                t3 - t2,
+                ustime() - t3);
+    }
+
+    // clear mappings: infq dist dir => infq temp dir
+    dictEmpty(server.repl_infq_temp_dirs, NULL);
+
+    return REDIS_OK;
+}
+
 void doneReadOneInfQFiles() {
-    // clear old infq dir
-    long long   t1, t2, t3;
+    robj    *temp_dir;
 
-    t1 = ustime();
-    if (access(server.repl_infq_dir, F_OK) == 0) {
-        t2 = ustime();
-        // clear old infq dir
-        if (removeDir(server.repl_infq_dir) == REDIS_ERR) {
-            redisLog(REDIS_WARNING, "Failed to remove old infq dir, dir: %s", server.repl_infq_dir);
-        }
-        t3 = ustime();
-    }
-
-    if (server.repl_infq_temp_dir != NULL) {
-        if (rename(server.repl_infq_temp_dir, server.repl_infq_dir) == -1) {
-            redisLog(REDIS_WARNING,"Failed trying to rename InfQ dir in MASTER <-> SLAVE synchronization: %s", strerror(errno));
-            replicationAbortRecvInfQ();
-            return;
-        }
-    }
-
-    redisLog(REDIS_DEBUG, "finish to rename temporary dir of a InfQ, key: %s, access: %lld, "
-            "remove dir: %lld, rename: %lld",
-            server.repl_infq_key,
-            t2 - t1,
-            t3 - t2,
-            ustime() - t3);
+    temp_dir = createRawStringObject(server.repl_infq_temp_dir, sdslen(server.repl_infq_temp_dir));
+    dictReplace(server.repl_infq_temp_dirs, sdsdup(server.repl_infq_dir), temp_dir);
 
     clearSds(&server.repl_infq_key);
     clearSds(&server.repl_infq_data_path);
@@ -1495,17 +1535,21 @@ void doneReadOneInfQFiles() {
 
 void doneReadAllInfQFiles() {
     redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: finishing to receive all InfQ keys");
+
+    signalFlushedDb(-1);
+    emptyDb(replicationEmptyDbCallback);
+
     // rename temp rdb and tmp InfQ dir
     if (rename(server.repl_transfer_tmpfile,server.rdb_filename) == -1) {
         redisLog(REDIS_WARNING,"Failed trying to rename the temp DB into dump.rdb in MASTER <-> SLAVE synchronization: %s", strerror(errno));
         replicationAbortRecvInfQ();
         return;
     }
-
-    signalFlushedDb(-1);
-    // NOTICE: 先清空DB, 否则如果主从库持有相同key的InfQ时
-    //      从库rename数据文件夹时会失败
-    emptyDb(replicationEmptyDbCallback);
+    if (renameInfQFiles() == REDIS_ERR) {
+        redisLog(REDIS_WARNING, "Failed to batch rename infq directoriest");
+        replicationAbortRecvInfQ();
+        return;
+    }
 
     /* Before loading the DB into memory we need to delete the readable
      * handler, otherwise it will get called recursively since

@@ -246,7 +246,7 @@ robj *createInfqObject(robj *key) {
     infq_config_t   conf;
     char            buf[1024];
     int             ret, len;
-    sds             s;
+    sds             key_str;
     char            *name;
 
     // make sure directory existence
@@ -265,12 +265,12 @@ robj *createInfqObject(robj *key) {
             return NULL;
         }
 
-        s = key->ptr;
+        key_str = key->ptr;
         len = strlen(server.infq_data_path);
         if (len && server.infq_data_path[len - 1] != '/') {
-            ret = snprintf(buf, 1024, "%s/%s", server.infq_data_path, s);
+            ret = snprintf(buf, 1024, "%s/%s", server.infq_data_path, key_str);
         } else {
-            ret = snprintf(buf, 1024, "%s%s", server.infq_data_path, s);
+            ret = snprintf(buf, 1024, "%s%s", server.infq_data_path, key_str);
         }
     } else {
         ret = snprintf(buf, 1024, "%s", server.infq_data_path);
@@ -296,7 +296,7 @@ robj *createInfqObject(robj *key) {
     }
     infq_t* q = infq_init_by_conf(&conf, name);
     if (q == NULL) {
-        redisLog(REDIS_NOTICE, "failed to init infQ, data_path: %s", buf);
+        redisLog(REDIS_NOTICE, "failed to init infQ, data_path: %s, key: %s", buf, name);
         return NULL;
     }
     robj *o = createObject(REDIS_INFQ, q);

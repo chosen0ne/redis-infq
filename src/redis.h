@@ -936,9 +936,6 @@ struct redisServer {
 
     /* Replication for InfQ */
     dict *infq_keys;  /* dict specify InfQ keys => DB(InfQ reside in) */
-    /* a memory block shared by main process and rdb process,
-     * which is used by rdb subprocess to pass file meta info to main process*/
-    dict *infq_metas; /* InfQ keys => file meta */
 
     int repl_infq_file_num; /* files need to receive from master */
     sds repl_infq_data_path;
@@ -953,6 +950,9 @@ struct redisServer {
     list *repl_infq_keys;   /* temporary store the infq keys for master to send to slave */
     int repl_infq_key_num;  /* count of infq keys need to receive from master */
     int repl_infq_cur_key_num;  /* count of infq key have received from master */
+    dict *repl_infq_temp_dirs;  /* infq dist dir => infq temp dir.
+                                   延迟重命名，在rdb load前，清空db前进行数据文件夹的重命名
+                                */
 
     struct tm tm_cache;     /* avoid to call 'localtime' concurrent which may cause the deadlock of
                                rdb process.
@@ -1259,9 +1259,6 @@ typedef struct {
     robj *min, *max;  /* May be set to shared.(minstring|maxstring) */
     int minex, maxex; /* are min or max exclusive? */
 } zlexrangespec;
-
-/* 用于遍历、回调每一个InfQ实例 */
-typedef int infq_iter_callback_t(infq_t *q, sds key, void *arg1, void* arg2);
 
 zskiplist *zslCreate(void);
 void zslFree(zskiplist *zsl);
@@ -1609,11 +1606,15 @@ void qinspectCommand(redisClient *c);
 void qrpoplpushCommand(redisClient *c);
 void qpushxCommand(redisClient *c);
 
+/* 用于遍历、回调每一个InfQ实例 */
+typedef int infq_iter_callback_t(infq_t *q, sds key, void *arg1, void* arg2);
+
 /* err_stop: 指定是否遇到某个infq回调失败，就返回错误 */
 int iterateInfQ(infq_iter_callback_t cb, void *arg1, void *arg2, int err_stop);
 void* createInfQMeta();
 int iter_infq_continue_unlinker(infq_t *q, sds key, void *arg1, void *arg2);
 int iter_infq_suspend_callback(infq_t *q, sds key, void *arg1, void *arg2);
+infq_dump_meta_t* fetch_infq_dump_meta(sds infq_key);
 /* Support for InfQ */
 
 #if defined(__GNUC__)

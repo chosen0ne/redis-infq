@@ -1937,7 +1937,7 @@ void initServer(void) {
 
     server.infq_unlinker_suspend_type = REDIS_INFQ_UNLINKER_SUSPEND_NONE;
     server.infq_keys = dictCreate(&keyptrDictType, NULL);
-    server.infq_metas = dictCreate(&infqMetaDictType, (void *)sizeof(infq_file_meta_t));
+    server.repl_infq_temp_dirs = dictCreate(&dbDictType, NULL);
     server.repl_infq_file_prefix = NULL;
     server.repl_infq_dir = NULL;
     server.repl_infq_temp_dir = NULL;
@@ -3179,13 +3179,20 @@ sds genRedisInfoString(char *section) {
                     continue;
                 }
 
-                info = sdscatprintf(info, "%s=[publks:%d, poblks:%d, fblks:%d, ms:%d, fs:%d]\r\n",
+                info = sdscatprintf(info, "%s=[publks:%d, poblks:%d, fblks:%d, ms:%d, fs:%d, "
+                        "dumper: (%d, %d), loader: (%d, %d), unlinker: (%d, %d)]\r\n",
                         (char *)key.ptr,
                         stats.pushq_used_blocks,
                         stats.popq_used_blocks,
                         stats.fileq_blocks_num,
                         stats.mem_size,
-                        stats.file_size);
+                        stats.file_size,
+                        stats.dumper.is_suspended,
+                        stats.dumper.job_num,
+                        stats.loader.is_suspended,
+                        stats.loader.job_num,
+                        stats.unlinker.is_suspended,
+                        stats.unlinker.job_num);
             }
         }
     }

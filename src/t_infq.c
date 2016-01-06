@@ -12,6 +12,27 @@
 
 #define INFQ_AT_MAX_BUF_SIZE    100 * 1024
 
+infq_dump_meta_t* fetch_infq_dump_meta(sds infq_key) {
+    redisDb *db;
+    robj    *qobj;
+    infq_t  *q;
+
+    db = (redisDb *)dictFetchValue(server.infq_keys, infq_key);
+    if (db == NULL) {
+        redisLog(REDIS_WARNING, "no db attached to infq, key: %s", infq_key);
+        return NULL;
+    }
+
+    qobj = dictFetchValue(db->dict, infq_key);
+    if (qobj == NULL || qobj->type != REDIS_INFQ) {
+        redisLog(REDIS_WARNING, "no object or not a infq obj specified by key, key: %s", infq_key);
+        return NULL;
+    }
+
+    q = (infq_t *)qobj->ptr;
+    return infq_fetch_dump_meta(q);
+}
+
 unsigned long infqLength(robj *q) {
     if (q->encoding == REDIS_ENCODING_INFQ) {
         return infq_size(q->ptr);
@@ -20,34 +41,9 @@ unsigned long infqLength(robj *q) {
     }
 }
 
-void* createInfQMeta() {
-    void    *m;
-
-    if ((m = mmap(
-            NULL,
-            sizeof(infq_file_meta_t),
-            PROT_READ | PROT_WRITE,
-            MAP_ANON | MAP_SHARED,
-            -1,
-            0)) == MAP_FAILED) {
-        redisLog(REDIS_WARNING, "failed to create shared mem for infq meta, err: %s",
-                strerror(errno));
-        return NULL;
-    }
-
-    return m;
-}
-
 robj* createInfQ(robj *key, redisDb *db) {
     robj        *q;
-    void        *m;
     dictEntry   *de;
-
-    // create shared mem for infq meta
-    if ((m = createInfQMeta()) == NULL) {
-        redisLog(REDIS_WARNING, "failed to create infq meta");
-        return NULL;
-    }
 
     q = createInfqObject(key);
     if (q == NULL) {
@@ -61,7 +57,6 @@ robj* createInfQ(robj *key, redisDb *db) {
     // NOTICE: dbAdd时会拷贝key，此处复用该key
     de = dictFind(db->dict, key->ptr);
     dictReplace(server.infq_keys, dictGetKey(de), db);
-    dictReplace(server.infq_metas, dictGetKey(de), m);
 
     return q;
 }
