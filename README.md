@@ -1,5 +1,5 @@
 #redis-infq
-Customed redis to integrate with infQ
+Customized redis to integrate with infQ
 
 ##Install
 Clone the code of infQ and redis-infq to the same directory and make them.
